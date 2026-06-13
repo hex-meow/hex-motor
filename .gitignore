@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+DESIGN.md
+
+# Example output (m5_subscribe_to_csv writes m5_status_0x<nid>.csv)
+m5_status_*.csv

@@ -1,0 +1,27 @@
+[package]
+name = "hex-motor"
+version = "0.1.0"
+edition = "2021"
+description = "Rust driver library for HEX-MECHA motors over CANopen, built on can-transport."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hexmecha/hex-motor.git"
+keywords = ["canopen", "motor", "cia402", "can", "robotics"]
+categories = ["embedded", "hardware-support"]
+
+[dependencies]
+can-transport = "0.1.1"
+canopen-sdo = "0.1.1"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio-util = "0.7"
+arc-swap = "1"
+thiserror = "1"
+log = "0.4"
+async-trait = "0.1"
+futures = "0.3"
+smallvec = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+anyhow = "1"
+can-transport = { version = "0.1.1", features = ["socketcan", "gs_usb"] }
