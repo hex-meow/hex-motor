@@ -5,5 +5,6 @@
 pub mod cob;
 pub mod heartbeat;
 pub mod nmt;
+pub mod rpdo_config;
 pub mod sdo;
 pub mod tpdo_config;

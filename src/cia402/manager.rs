@@ -556,6 +556,16 @@ impl Cia402Manager {
         &self.opts
     }
 
+    /// 共享底层 CAN 总线句柄。
+    ///
+    /// 上层"机器人应用"（例如以固定频率向多电机广播 RPDO 的底盘）需要在
+    /// manager 已经接管发现 / TPDO 监听 / 心跳广播的同一条总线上**直接发原始
+    /// 帧**。一个物理适配器（如 gs_usb）不能被打开两次，所以这里把 manager 持有的
+    /// `Arc<dyn CanBus>` clone 出去共享。`send` 是 `&self`，与后台 task 并发安全。
+    pub fn bus(&self) -> Arc<dyn CanBus> {
+        self.bus.clone()
+    }
+
     /// 拿到 / 建立指定 nid 的 entry。
     fn get_or_insert_entry(&self, nid: u8) -> Arc<MotorEntry> {
         let mut g = self.motors.write().unwrap();
