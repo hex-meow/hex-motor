@@ -7,6 +7,7 @@
 pub mod known_devices;
 
 pub mod codec;
+pub mod compressed_mit;
 pub mod events;
 pub mod initialize;
 pub mod manager;
@@ -21,6 +22,9 @@ mod motor_entry;
 mod tpdo_listener;
 mod velocity;
 
+pub use compressed_mit::{
+    CompressedMitMapping, CompressedMitTarget, DEFAULT_SHARED_COB_ID,
+};
 pub use events::{Cia402Event, EventStream, EventStreamItem};
 pub use initialize::{
     default_tpdo1_recipe, default_tpdo2_recipe, DEFAULT_TPDO1_COMM, DEFAULT_TPDO1_ENTRIES,
