@@ -1,10 +1,11 @@
 [package]
 name = "hex-motor"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
+authors = ["kisonhe <kisonhe@hexmeow.com>"]
 description = "Rust driver library for HEX-MECHA motors over CANopen, built on can-transport."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/hexmecha/hex-motor.git"
+repository = "https://github.com/hex-meow/hex-motor.git"
 keywords = ["canopen", "motor", "cia402", "can", "robotics"]
 categories = ["embedded", "hardware-support"]
 
