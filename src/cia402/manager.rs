@@ -329,6 +329,22 @@ impl Cia402Manager {
     /// - [`Error::InErrorState`]：等待期间电机报 Fault
     /// - [`Error::Sdo`] / [`Error::Transport`]：底层透传
     pub async fn set_mode(&self, nid: u8, mode: MotorMode) -> Result<()> {
+        self.set_mode_with_pre_enable_guard(nid, mode, || Ok(()))
+            .await
+    }
+
+    /// [`set_mode`](Self::set_mode) with one synchronous guard immediately
+    /// before the final `EnableOperation` controlword.  The guard must not
+    /// block; an error skips electrical enable and is returned to the caller.
+    pub async fn set_mode_with_pre_enable_guard<F>(
+        &self,
+        nid: u8,
+        mode: MotorMode,
+        pre_enable: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
         let entry = self.require_initialized(nid)?;
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "set_mode")?;
 
@@ -361,7 +377,14 @@ impl Cia402Manager {
             "nid 0x{nid:02X}: set_mode({mode:?}) -> {} SDO writes",
             writes.len()
         );
-        self.sdo_download_sequential(nid, &writes).await?;
+        let (enable, preparation) = writes
+            .split_last()
+            .ok_or_else(|| Error::Internal("set_mode produced no SDO writes".into()))?;
+        self.sdo_download_sequential(nid, preparation).await?;
+        tokio::time::sleep(INTER_WRITE_DELAY).await;
+        pre_enable()?;
+        self.sdo_download_sequential(nid, std::slice::from_ref(enable))
+            .await?;
 
         wait_for_mode(&entry, mode, self.opts.mode_confirm_timeout).await
     }

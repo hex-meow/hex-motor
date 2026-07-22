@@ -171,6 +171,44 @@ pub async fn configure(
     kp_kd_torque_permille: u16,
     timeout: Option<Duration>,
 ) -> Result<()> {
+    configure_with_pre_enable_guard(
+        bus,
+        nid,
+        slice,
+        total,
+        cob_id,
+        mapping,
+        torque_permille,
+        kp_kd_torque_permille,
+        timeout,
+        || Ok(()),
+    )
+    .await
+}
+
+/// [`configure`] with one synchronous guard immediately before the final
+/// `Switch On + Enable Operation` controlword (`0x000F`).  Long initialization
+/// sequences can use this to revalidate an external safety permit at the
+/// electrical-enable boundary without duplicating the vendor SDO recipe.
+///
+/// The guard must not block.  Returning an error leaves the node at most in the
+/// pre-enable `0x0007` state and skips `0x000F`.
+#[allow(clippy::too_many_arguments)]
+pub async fn configure_with_pre_enable_guard<F>(
+    bus: &(impl CanBus + ?Sized),
+    nid: u8,
+    slice: u8,
+    total: u8,
+    cob_id: u16,
+    mapping: &CompressedMitMapping,
+    torque_permille: u16,
+    kp_kd_torque_permille: u16,
+    timeout: Option<Duration>,
+    pre_enable: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     // 1) 最大力矩限制(全模式 + MIT KP/KD 项)
     sdo::download_u16(bus, nid, OD_MAX_TORQUE, 0, torque_permille, timeout).await?;
     gap().await;
@@ -225,10 +263,13 @@ pub async fn configure(
     // 6) MIT 模式 + 使能(6→7→0x0F)
     sdo::download(bus, nid, OD_MODE, 0, &MODE_MIT.to_le_bytes(), timeout).await?;
     gap().await;
-    for cw in [0x0006u16, 0x0007, 0x000F] {
+    for cw in [0x0006u16, 0x0007] {
         sdo::download_u16(bus, nid, OD_CONTROLWORD, 0, cw, timeout).await?;
         gap().await;
     }
+    pre_enable()?;
+    sdo::download_u16(bus, nid, OD_CONTROLWORD, 0, 0x000F, timeout).await?;
+    gap().await;
     Ok(())
 }
 
