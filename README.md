@@ -234,15 +234,21 @@ Linux 上 gs_usb 需要 usbfs 访问权限（sudo 或 udev 规则），后端会
 ```rust
 KnownDevice {
     vendor_id:    0x12_34_56_78,
-    product_code: Some(0xAABB_CCDD), // None 表示该 vendor 兜底
+    product_code: 0xAABB_CCDD,
     name:         "MyMotor Pro Max",
 },
 ```
 
 `MotorInfo::friendly_name()` 的优先级：
 1. 电机自己上报的 `0x1008` Manufacturer Device Name（非空且非纯空白）
-2. 查 `KNOWN_DEVICES`：精确匹配 `(vendor, product)` > 同 vendor 兜底
-3. 都没命中 → `"Unknown CiA402 device (vendor 0x..., product 0x...)"`
+2. 查 `KNOWN_DEVICES`：必须精确匹配 `(vendor, product)`
+3. 都没命中 → `"Unknown CANopen device (vendor 0x..., product 0x...)"`
+
+不能只凭 vendor ID 推断产品、对象字典或展示名称。
+
+身份识别成功后，Manager 会按精确 `(vendor_id, product_code)` 方言读取一次设备
+CAN 配置，并缓存到 `MotorInfo::can_config`。驱动只报告设备值和读取状态，
+不判断其是否符合主机或应用策略；未知产品也不会被试探性读取 vendor 对象。
 
 ---
 

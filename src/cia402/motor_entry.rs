@@ -15,7 +15,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 
 use crate::canopen::nmt::NmtState;
-use crate::types::{MotorIdentity, MotorMode};
+use crate::types::{DeviceCanConfigStatus, MotorIdentity, MotorMode};
 
 use super::subscribe::Subscriber;
 use super::types::{Connection, LiveState, Logic, Measurements, MotorLifecycle};
@@ -35,6 +35,8 @@ pub(crate) struct MotorEntry {
 #[derive(Debug)]
 pub(crate) struct MotorEntryInner {
     pub identity: Option<MotorIdentity>,
+    /// 设备对象字典报告的 CAN 配置。身份读取完成后按精确产品方言读取一次。
+    pub can_config: DeviceCanConfigStatus,
     pub lifecycle: MotorLifecycle,
     /// 缓存的在线状态。由 liveness monitor 更新；list() 直接读。
     pub online: bool,
@@ -74,6 +76,7 @@ impl MotorEntry {
             node_id,
             inner: Mutex::new(MotorEntryInner {
                 identity: None,
+                can_config: DeviceCanConfigStatus::Pending,
                 lifecycle: MotorLifecycle::Unknown,
                 online: false,
                 last_heartbeat: None,
@@ -152,6 +155,7 @@ mod tests {
         assert_eq!(g.lifecycle, MotorLifecycle::Unknown);
         assert!(!g.online);
         assert!(g.identity.is_none());
+        assert_eq!(g.can_config, DeviceCanConfigStatus::Pending);
         assert!(g.last_heartbeat.is_none());
         assert!(g.last_tpdo.is_none());
     }

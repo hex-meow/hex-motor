@@ -27,7 +27,8 @@ pub enum Cia402Event {
     /// 第一次看到某 nid 的入向心跳（之前不在表里）。
     NodeAppeared { nid: u8 },
 
-    /// 成功读到了 0x1018 (+ 可选 0x1008)。
+    /// 成功读到了 0x1018 (+ 可选 0x1008)。事件发出时 `MotorInfo::can_config`
+    /// 已经是 `Available`、`Unsupported` 或 `ReadFailed`。
     Identified { nid: u8, identity: MotorIdentity },
 
     /// 试图 identify 一个节点但 SDO 失败 / 超时。节点保留在 `Unknown` 状态，

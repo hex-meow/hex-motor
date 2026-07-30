@@ -10,9 +10,12 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::canopen::{nmt, sdo};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::types::MotorIdentity;
 
+use super::device_can::{
+    begin_device_can_config_read, finish_device_can_config_read, read_device_can_config,
+};
 use super::events::Cia402Event;
 use super::motor_entry::MotorEntry;
 use super::types::{MotorLifecycle, ReinitReason};
@@ -184,36 +187,51 @@ fn spawn_identify_if_idle(
             return;
         }
     }
+    let inflight_guard = OwnedInflightGuard { set: inflight, nid };
 
     tokio::spawn(async move {
+        let _inflight_guard = inflight_guard;
         let res = tokio::select! {
-            _ = cancel.cancelled() => Err(Error::Internal("cancelled".into())),
-            r = identify_once(bus.as_ref(), nid, sdo_timeout) => r,
+            _ = cancel.cancelled() => None,
+            r = async {
+                let identity = identify_once(bus.as_ref(), nid, sdo_timeout).await?;
+                begin_device_can_config_read(&entry, &identity);
+                let can_config =
+                    read_device_can_config(bus.as_ref(), &identity, sdo_timeout).await;
+                if let crate::types::DeviceCanConfigStatus::ReadFailed { reason } = &can_config {
+                    log::warn!("read CAN config for nid 0x{nid:02X} failed: {reason}");
+                }
+                finish_device_can_config_read(&entry, can_config);
+                Ok::<MotorIdentity, crate::error::Error>(identity)
+            } => Some(r),
         };
 
         match res {
-            Ok(identity) => {
-                {
-                    let mut inner = entry.inner.lock().unwrap();
-                    inner.identity = Some(identity.clone());
-                    // 仅在还是 Unknown 时升级到 Identified（避免覆盖 M3+ 写入的状态）
-                    if matches!(inner.lifecycle, MotorLifecycle::Unknown) {
-                        inner.lifecycle = MotorLifecycle::Identified;
-                    }
-                }
+            Some(Ok(identity)) => {
                 let _ = events_tx.send(Cia402Event::Identified { nid, identity });
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 log::warn!("identify nid 0x{nid:02X} failed: {e}");
                 let _ = events_tx.send(Cia402Event::IdentifyFailed {
                     nid,
                     reason: e.to_string(),
                 });
             }
+            None => log::debug!("identify nid 0x{nid:02X} cancelled"),
         }
-
-        inflight.lock().unwrap().remove(&nid);
     });
+}
+
+/// 后台 identify task 独占节点的 owned guard。任务取消、panic 或正常退出都会清理。
+struct OwnedInflightGuard {
+    set: Arc<StdMutex<HashSet<u8>>>,
+    nid: u8,
+}
+
+impl Drop for OwnedInflightGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.nid);
+    }
 }
 
 /// 读 0x1018 (强制) + 0x1008 (可选)。0x1008 失败只记日志。
@@ -320,6 +338,188 @@ pub(crate) async fn run_liveness_monitor(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use can_transport::{CanCapabilities, CanFrame, CanId, CanIoError, CanRx};
+    use tokio::sync::{mpsc, Notify};
+
+    #[tokio::test]
+    async fn cancelling_during_config_read_releases_bus_and_inflight_immediately() {
+        let state = Arc::new(BlockingConfigState::default());
+        let concrete_bus = Arc::new(BlockingConfigBus::new(state.clone()));
+        let weak_bus = Arc::downgrade(&concrete_bus);
+        let bus: Arc<dyn CanBus> = concrete_bus.clone();
+        let entry = Arc::new(MotorEntry::new(1));
+        let inflight = Arc::new(StdMutex::new(HashSet::new()));
+        let (events_tx, _) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+
+        spawn_identify_if_idle(
+            1,
+            entry.clone(),
+            inflight.clone(),
+            events_tx,
+            bus,
+            Duration::from_secs(5),
+            cancel.clone(),
+        );
+        drop(concrete_bus);
+
+        tokio::time::timeout(Duration::from_secs(1), state.wait_until_config_requested())
+            .await
+            .expect("identify should reach the deliberately blocked config SDO");
+        assert!(entry.inner.lock().unwrap().identity.is_some());
+        assert!(inflight.lock().unwrap().contains(&1));
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let inflight_cleared = !inflight.lock().unwrap().contains(&1);
+                let bus_released = weak_bus.upgrade().is_none();
+                if inflight_cleared && bus_released {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled identify task should promptly release its bus and inflight slot");
+    }
+
+    #[derive(Default)]
+    struct BlockingConfigState {
+        config_requested: AtomicBool,
+        notify: Notify,
+    }
+
+    impl BlockingConfigState {
+        fn mark_config_requested(&self) {
+            self.config_requested.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+
+        async fn wait_until_config_requested(&self) {
+            loop {
+                if self.config_requested.load(Ordering::Acquire) {
+                    return;
+                }
+                self.notify.notified().await;
+            }
+        }
+    }
+
+    struct BlockingConfigBus {
+        state: Arc<BlockingConfigState>,
+        response_tx: StdMutex<Option<mpsc::UnboundedSender<CanFrame>>>,
+    }
+
+    impl BlockingConfigBus {
+        fn new(state: Arc<BlockingConfigState>) -> Self {
+            Self {
+                state,
+                response_tx: StdMutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CanBus for BlockingConfigBus {
+        async fn send(&self, frame: CanFrame) -> std::result::Result<(), CanIoError> {
+            let request = frame.data();
+            if request.len() != 8 || request[0] != 0x40 {
+                return Err(CanIoError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test bus expected an expedited SDO upload request",
+                )));
+            }
+            let nid = match frame.id() {
+                CanId::Standard(id) if (0x601..=0x67F).contains(&id) => (id - 0x600) as u8,
+                _ => {
+                    return Err(CanIoError::backend(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "test bus received an invalid RSDO COB-ID",
+                    )))
+                }
+            };
+            let index = u16::from_le_bytes([request[1], request[2]]);
+            let subindex = request[3];
+
+            if index == 0x2001 {
+                self.state.mark_config_requested();
+                // Deliberately leave this SDO unanswered. Cancellation must drop the read future.
+                return Ok(());
+            }
+
+            let value = match (index, subindex) {
+                (0x1018, 1) => 0x4859_444Cu32.to_le_bytes().to_vec(),
+                (0x1018, 2) => 0xAAAA_0001u32.to_le_bytes().to_vec(),
+                (0x1018, 3 | 4) => 0u32.to_le_bytes().to_vec(),
+                (0x1008, 0) => b"X".to_vec(),
+                _ => {
+                    return Err(CanIoError::backend(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unexpected test SDO 0x{index:04X}:{subindex:02X}"),
+                    )))
+                }
+            };
+
+            let mut response = [0u8; 8];
+            response[0] = 0x43 | (((4 - value.len()) as u8) << 2);
+            response[1] = request[1];
+            response[2] = request[2];
+            response[3] = subindex;
+            response[4..4 + value.len()].copy_from_slice(&value);
+            let response = CanFrame::new_data(0x580u16 + nid as u16, &response)?;
+            self.response_tx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .ok_or(CanIoError::Disconnected)?
+                .send(response)
+                .map_err(|_| CanIoError::Disconnected)
+        }
+
+        async fn subscribe(
+            &self,
+            _filter: CanFilter,
+        ) -> std::result::Result<Box<dyn CanRx>, CanIoError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.response_tx.lock().unwrap() = Some(tx);
+            Ok(Box::new(BlockingConfigRx { rx }))
+        }
+
+        fn capabilities(&self) -> CanCapabilities {
+            CanCapabilities {
+                fd: true,
+                max_dlen: 64,
+            }
+        }
+    }
+
+    struct BlockingConfigRx {
+        rx: mpsc::UnboundedReceiver<CanFrame>,
+    }
+
+    #[async_trait]
+    impl CanRx for BlockingConfigRx {
+        async fn recv(&mut self) -> std::result::Result<CanFrame, CanIoError> {
+            self.rx.recv().await.ok_or(CanIoError::Disconnected)
+        }
+
+        fn try_recv(&mut self) -> std::result::Result<Option<CanFrame>, CanIoError> {
+            match self.rx.try_recv() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(CanIoError::Disconnected),
             }
         }
     }

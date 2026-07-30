@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use crate::canopen::nmt::NmtState;
-use crate::types::{MotorErrorKind, MotorIdentity, MotorMode};
+use crate::types::{DeviceCanConfigStatus, MotorErrorKind, MotorIdentity, MotorMode};
 
 /// 节点在 Manager 视角下的生命周期（详见 `DESIGN.md` §1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +58,8 @@ pub struct MotorInfo {
     pub node_id: u8,
     /// `Unknown` 阶段为 `None`。
     pub identity: Option<MotorIdentity>,
+    /// 初始化身份读取后缓存的设备 CAN 配置读取状态。
+    pub can_config: DeviceCanConfigStatus,
     pub lifecycle: MotorLifecycle,
     /// 最近 ~2.5 个 `heartbeat_period` 内有过 HB 或 TPDO。
     pub online: bool,
@@ -163,6 +165,7 @@ mod tests {
         MotorInfo {
             node_id: nid,
             identity,
+            can_config: DeviceCanConfigStatus::Pending,
             lifecycle,
             online,
             logic: None,
@@ -197,13 +200,13 @@ mod tests {
     fn friendly_name_uses_known_devices_table() {
         let id = MotorIdentity {
             node_id: 0x10,
-            vendor_id: 0x0068_6578,
+            vendor_id: 0x4859_444C,
             product_code: 0xAAAA_0002,
             revision_number: 0,
             serial_number: 0,
             product_name: None,
         };
         let m = motor_info(0x10, Some(id), MotorLifecycle::Identified, true);
-        assert_eq!(m.friendly_name(), "HexMeow Motor");
+        assert_eq!(m.friendly_name(), "CiA402 HEX-4342P");
     }
 }

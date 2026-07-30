@@ -16,6 +16,7 @@ pub mod subscribe;
 pub mod types;
 
 // 内部模块，不导出
+mod device_can;
 mod discovery;
 mod heartbeat;
 mod motor_entry;

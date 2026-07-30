@@ -23,6 +23,9 @@ use crate::canopen::tpdo_config::SdoWrite;
 use crate::error::{Error, Result};
 use crate::types::{MotorMode, MotorTarget};
 
+use super::device_can::{
+    begin_device_can_config_read, finish_device_can_config_read, read_device_can_config,
+};
 use super::discovery::{identify_once, run_discovery, run_liveness_monitor};
 use super::events::{Cia402Event, EventStream, DEFAULT_EVENTS_CAPACITY};
 use super::heartbeat::run_hb_broadcast;
@@ -218,6 +221,7 @@ impl Cia402Manager {
                 MotorInfo {
                     node_id: e.node_id,
                     identity: inner.identity.clone(),
+                    can_config: inner.can_config.clone(),
                     lifecycle: inner.lifecycle.clone(),
                     online: inner.online,
                     logic: inner.logic.clone(),
@@ -235,25 +239,28 @@ impl Cia402Manager {
         EventStream::new(self.events_tx.subscribe())
     }
 
-    /// 强制重读指定节点的 0x1018（+ 0x1008 可选）。
+    /// 强制重读指定节点的 0x1018（+ 0x1008 可选）和设备 CAN 配置。
     ///
     /// - 若节点尚未在 list 中，会先创建一个 `Unknown` 条目。
     /// - 与背景自动 identify / 任何 `initialize()` 互斥（共享 `inflight_ops`），
     ///   重复时返回 `Error::Internal("... already in progress")`。
+    /// - CAN 配置失败会记录在 `MotorInfo::can_config`，不会让已成功的身份读取失败。
     pub async fn identify(&self, nid: u8) -> Result<()> {
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "identify")?;
 
         let entry = self.get_or_insert_entry(nid);
         let identity = identify_once(self.bus.as_ref(), nid, self.opts.sdo_timeout).await?;
 
-        {
-            let mut inner = entry.inner.lock().unwrap();
-            inner.identity = Some(identity.clone());
-            if matches!(inner.lifecycle, MotorLifecycle::Unknown) {
-                inner.lifecycle = MotorLifecycle::Identified;
-            }
+        begin_device_can_config_read(&entry, &identity);
+        let can_config =
+            read_device_can_config(self.bus.as_ref(), &identity, self.opts.sdo_timeout).await;
+        if let crate::types::DeviceCanConfigStatus::ReadFailed { reason } = &can_config {
+            log::warn!("read CAN config for nid 0x{nid:02X} failed: {reason}");
         }
-        let _ = self.events_tx.send(Cia402Event::Identified { nid, identity });
+        finish_device_can_config_read(&entry, can_config);
+        let _ = self
+            .events_tx
+            .send(Cia402Event::Identified { nid, identity });
         Ok(())
     }
 

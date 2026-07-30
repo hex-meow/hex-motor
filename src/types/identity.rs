@@ -12,6 +12,23 @@ pub struct MotorIdentity {
 }
 
 impl MotorIdentity {
-    /// HexMeow Vendor ID。来自 custom-protocol.md / custom-od.md。
-    pub const HEXMEOW_VENDOR_ID: u32 = 0x0068_6578;
+    /// HexFellow Vendor ID。
+    pub const HEXFELLOW_VENDOR_ID: u32 = 0x0068_6578;
+    /// HexMeow Vendor ID。
+    pub const HEXMEOW_VENDOR_ID: u32 = 0x6865_786D;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MotorIdentity;
+
+    #[test]
+    fn vendor_ids_are_distinct_and_correctly_named() {
+        assert_eq!(MotorIdentity::HEXFELLOW_VENDOR_ID, 0x0068_6578);
+        assert_eq!(MotorIdentity::HEXMEOW_VENDOR_ID, 0x6865_786D);
+        assert_ne!(
+            MotorIdentity::HEXFELLOW_VENDOR_ID,
+            MotorIdentity::HEXMEOW_VENDOR_ID
+        );
+    }
 }
