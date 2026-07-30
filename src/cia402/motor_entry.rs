@@ -21,6 +21,14 @@ use super::subscribe::Subscriber;
 use super::types::{Connection, LiveState, Logic, Measurements, MotorLifecycle};
 use super::velocity::VelocityEstimator;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoIdentifyState {
+    /// 当前 session 尚未消费自动识别机会。
+    Ready,
+    /// 当前 session 的自动识别机会已消费，无论成功失败都不再自动重试。
+    Attempted,
+}
+
 #[derive(Debug)]
 pub(crate) struct MotorEntry {
     pub node_id: u8,
@@ -34,6 +42,11 @@ pub(crate) struct MotorEntry {
 
 #[derive(Debug)]
 pub(crate) struct MotorEntryInner {
+    /// Boot-Up 或 online→offline 边沿递增，用来丢弃旧异步任务结果。
+    pub session_epoch: u64,
+    /// 入向心跳的 NMT 状态发生变化时递增，用于设置事务的 TOCTOU 检查。
+    pub nmt_revision: u64,
+    pub auto_identify_state: AutoIdentifyState,
     pub identity: Option<MotorIdentity>,
     /// 设备对象字典报告的 CAN 配置。身份读取完成后按精确产品方言读取一次。
     pub can_config: DeviceCanConfigStatus,
@@ -75,6 +88,9 @@ impl MotorEntry {
         Self {
             node_id,
             inner: Mutex::new(MotorEntryInner {
+                session_epoch: 0,
+                nmt_revision: 0,
+                auto_identify_state: AutoIdentifyState::Ready,
                 identity: None,
                 can_config: DeviceCanConfigStatus::Pending,
                 lifecycle: MotorLifecycle::Unknown,
@@ -153,6 +169,9 @@ mod tests {
         let e = MotorEntry::new(0x10);
         let g = e.inner.lock().unwrap();
         assert_eq!(g.lifecycle, MotorLifecycle::Unknown);
+        assert_eq!(g.session_epoch, 0);
+        assert_eq!(g.nmt_revision, 0);
+        assert_eq!(g.auto_identify_state, AutoIdentifyState::Ready);
         assert!(!g.online);
         assert!(g.identity.is_none());
         assert_eq!(g.can_config, DeviceCanConfigStatus::Pending);

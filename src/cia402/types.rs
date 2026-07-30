@@ -56,6 +56,8 @@ pub enum Logic {
 #[derive(Debug, Clone)]
 pub struct MotorInfo {
     pub node_id: u8,
+    /// 当前在线会话代数。Boot-Up 或 online→offline 边沿会递增。
+    pub session_epoch: u64,
     /// `Unknown` 阶段为 `None`。
     pub identity: Option<MotorIdentity>,
     /// 初始化身份读取后缓存的设备 CAN 配置读取状态。
@@ -164,6 +166,7 @@ mod tests {
     ) -> MotorInfo {
         MotorInfo {
             node_id: nid,
+            session_epoch: 0,
             identity,
             can_config: DeviceCanConfigStatus::Pending,
             lifecycle,

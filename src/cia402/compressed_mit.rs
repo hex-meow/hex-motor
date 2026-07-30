@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(b.len(), 8);
         // kp/kd 下限为 0 → 量化精确为 0(高字节里 kp 部分应为 0)
         let upper = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-        assert_eq!(upper >> 0 & 0xF, 0, "kp high nibble should be 0 for kp=0");
+        assert_eq!(upper & 0xF, 0, "kp high nibble should be 0 for kp=0");
     }
 
     #[test]

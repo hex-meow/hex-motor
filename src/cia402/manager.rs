@@ -13,18 +13,25 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use can_transport::CanBus;
+use canopen_sdo::{asynch::AsyncSdoError, SdoAbortCode, SdoError};
 use futures::future::join_all;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::canopen::nmt::NmtState;
 use crate::canopen::sdo;
 use crate::canopen::tpdo_config::SdoWrite;
 use crate::error::{Error, Result};
-use crate::types::{MotorMode, MotorTarget};
+use crate::types::{
+    DeviceCanConfig, DeviceCanConfigStatus, DeviceSettingsResult, DeviceSettingsUpdate, MotorMode,
+    MotorTarget,
+};
 
 use super::device_can::{
-    begin_device_can_config_read, finish_device_can_config_read, read_device_can_config,
+    begin_device_can_config_read, build_device_settings_plan, dialect_for_tuple,
+    finish_device_can_config_read, is_object_2001_tuple, read_device_can_config,
+    read_device_settings_snapshot, validate_role_node_id, DeviceSettingsSnapshot,
 };
 use super::discovery::{identify_once, run_discovery, run_liveness_monitor};
 use super::events::{Cia402Event, EventStream, DEFAULT_EVENTS_CAPACITY};
@@ -112,6 +119,13 @@ pub struct Cia402Manager {
     cancel: CancellationToken,
     /// 后台 task 句柄。`drop` 时通过 `cancel` 让它们退出，不在 drop 里 await。
     tasks: Vec<JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceSessionToken {
+    session_epoch: u64,
+    nmt_revision: u64,
+    nmt_state: NmtState,
 }
 
 impl std::fmt::Debug for Cia402Manager {
@@ -220,6 +234,7 @@ impl Cia402Manager {
                 let inner = e.inner.lock().unwrap();
                 MotorInfo {
                     node_id: e.node_id,
+                    session_epoch: inner.session_epoch,
                     identity: inner.identity.clone(),
                     can_config: inner.can_config.clone(),
                     lifecycle: inner.lifecycle.clone(),
@@ -249,18 +264,37 @@ impl Cia402Manager {
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "identify")?;
 
         let entry = self.get_or_insert_entry(nid);
+        let session_epoch = entry.inner.lock().unwrap().session_epoch;
         let identity = identify_once(self.bus.as_ref(), nid, self.opts.sdo_timeout).await?;
 
-        begin_device_can_config_read(&entry, &identity);
+        if !begin_device_can_config_read(&entry, session_epoch, &identity) {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed during identity read",
+            ));
+        }
         let can_config =
             read_device_can_config(self.bus.as_ref(), &identity, self.opts.sdo_timeout).await;
         if let crate::types::DeviceCanConfigStatus::ReadFailed { reason } = &can_config {
             log::warn!("read CAN config for nid 0x{nid:02X} failed: {reason}");
         }
-        finish_device_can_config_read(&entry, can_config);
+        if !finish_device_can_config_read(&entry, session_epoch, can_config) {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed during configuration read",
+            ));
+        }
+        let inner = entry.inner.lock().unwrap();
+        if inner.session_epoch != session_epoch {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed before identity result was published",
+            ));
+        }
         let _ = self
             .events_tx
             .send(Cia402Event::Identified { nid, identity });
+        drop(inner);
         Ok(())
     }
 
@@ -418,29 +452,101 @@ impl Cia402Manager {
         self.sdo_download_sequential(nid, &writes).await
     }
 
-    /// 改电机 Node-ID（出厂 / 批量配置工具用）。
+    /// 按精确 `(vendor_id, product_code)` 应用设备通信设置。
     ///
-    /// 写 `0x2001:01 = new_id`（Uint8），再写 `0x1010:01 = 0x65766173`（ASCII
-    /// `"save"`）触发保存。**电机重新上电后才生效**；改完旧 ID 仍在用直到掉电。
+    /// 安全边界：
+    /// - 整个事务与 identify / initialize / 其它 SDO 操作共享同一独占区；
+    /// - 只接受本次会话已收到心跳、且当前处于 Pre-Operational 或 Stopped 的节点；
+    /// - 写入前强制重读 0x1018 并与调用方给出的身份比较，未知方言一律拒绝；
+    /// - 随后强制重读设置对象的形状和值，并按该设备的持久化协议写入目标配置。
     ///
-    /// **不要求 Initialized**：电机只要在线（PreOperational/Operational 下 SDO
-    /// 可达）即可，所以发现到就能改。与该 nid 上的 identify/initialize 互斥。
-    pub async fn change_node_id(&self, nid: u8, new_id: u8) -> Result<()> {
-        if !(1..=127).contains(&new_id) {
-            return Err(Error::Internal(format!(
-                "new node id must be 1..=127, got {new_id}"
-            )));
-        }
-        let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "change_node_id")?;
-        let timeout = Some(self.opts.sdo_timeout);
-        // 0x2001:01 Node-ID (Uint8)
-        sdo::download_u8(self.bus.as_ref(), nid, 0x2001, 1, new_id, timeout).await?;
-        // 0x1010:01 store parameters = "save" = 0x65766173
-        sdo::download_u32(self.bus.as_ref(), nid, 0x1010, 1, 0x6576_6173, timeout).await?;
+    /// 驱动不会发送 NMT、心跳或复位命令。返回值会说明是否需要用户自行重启。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_device_settings(
+        &self,
+        nid: u8,
+        expected_vendor_id: u32,
+        expected_product_code: u32,
+        update: DeviceSettingsUpdate,
+    ) -> Result<DeviceSettingsResult> {
+        self.validate_settings_target(
+            nid,
+            expected_vendor_id,
+            expected_product_code,
+            update,
+        )?;
+        let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "apply_device_settings")?;
+        let (entry, session) = self.require_current_session_online(nid, true)?;
+        self.verify_identity_tuple_in_session(
+            nid,
+            &entry,
+            session,
+            true,
+            expected_vendor_id,
+            expected_product_code,
+        )
+        .await?;
+        let snapshot = self
+            .read_current_settings(nid, expected_vendor_id, expected_product_code)
+            .await?;
+        self.ensure_device_session(nid, &entry, session, true)?;
+        self.reject_online_node_id_collision(nid, update.new_node_id)?;
+        self.probe_target_node_id_available(nid, update.new_node_id)
+            .await?;
+        self.ensure_device_session(nid, &entry, session, true)?;
+        let plan = build_device_settings_plan(&snapshot, update)
+            .map_err(|reason| device_operation_rejected(nid, reason))?;
+        self.sdo_download_session_checked(nid, &entry, session, true, &plan.writes)
+            .await?;
+        self.cache_applied_settings(nid, &entry, session, update)?;
         log::info!(
-            "nid 0x{nid:02X}: wrote new Node-ID 0x{new_id:02X} + save \
-             (power-cycle the motor to apply)"
+            "nid 0x{nid:02X}: device settings transaction complete \
+             (changed={}, restart_required={}, persistence_pending={})",
+            plan.result.changed,
+            plan.result.restart_required,
+            plan.result.persistence_pending
         );
+        Ok(plan.result)
+    }
+
+    /// 兼容旧调用方的仅改 Node-ID API。
+    ///
+    /// 与旧实现不同，本方法不会猜测对象字典：它只接受已经缓存为受支持精确身份
+    /// 的节点，并在同一独占事务中重读 0x1018 和当前设置后，选择正确的对象。
+    pub async fn change_node_id(&self, nid: u8, new_id: u8) -> Result<()> {
+        let (expected_vendor_id, expected_product_code) =
+            self.cached_supported_identity_tuple(nid)?;
+        self.validate_node_id_target(
+            nid,
+            expected_vendor_id,
+            expected_product_code,
+            new_id,
+        )?;
+
+        let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "change_node_id")?;
+        let (entry, session) = self.require_current_session_online(nid, true)?;
+        self.verify_identity_tuple_in_session(
+            nid,
+            &entry,
+            session,
+            true,
+            expected_vendor_id,
+            expected_product_code,
+        )
+        .await?;
+        let snapshot = self
+            .read_current_settings(nid, expected_vendor_id, expected_product_code)
+            .await?;
+        self.ensure_device_session(nid, &entry, session, true)?;
+        self.reject_online_node_id_collision(nid, new_id)?;
+        self.probe_target_node_id_available(nid, new_id).await?;
+        self.ensure_device_session(nid, &entry, session, true)?;
+        let update = update_with_new_node_id(&snapshot, new_id);
+        let plan = build_device_settings_plan(&snapshot, update)
+            .map_err(|reason| device_operation_rejected(nid, reason))?;
+        self.sdo_download_session_checked(nid, &entry, session, true, &plan.writes)
+            .await?;
+        self.cache_applied_settings(nid, &entry, session, update)?;
         Ok(())
     }
 
@@ -453,34 +559,148 @@ impl Cia402Manager {
             .retain(|_, e| e.inner.lock().unwrap().online);
     }
 
-    /// 用户位置预设（零点工具用）。把电机**当前**转子位置设成 `pos`（Rev，
-    /// clamp 到 -0.5..=0.5）。详见 huayi.md §3.6。
+    /// 身份严格的位置预设。只允许三条已知 0x2001 电机身份。
     ///
-    /// 序列：`0x6040 = 0x0000`（确保 Switch On Disabled，预设只在此状态生效）→
-    /// `0x3001:01 = f32(pos)` → `0x3001:02 = 0x73657270`（ASCII `"pres"`，写入后
-    /// 电机把当前位置设为 0x3001:01 并自动保存、自动清零）。
-    ///
-    /// **不要求 Initialized**：电机刚上电即在 Switch On Disabled，发现到就能调。
-    pub async fn set_position_preset(&self, nid: u8, pos: f32) -> Result<()> {
+    /// 写控制字 0 后会有界轮询 0x6041，确认进入 Switch On Disabled，随后才写
+    /// 位置和 `"pres"`。整个过程不会发送 NMT 或后台重试。
+    pub async fn set_position_preset_for(
+        &self,
+        nid: u8,
+        expected_vendor_id: u32,
+        expected_product_code: u32,
+        pos: f32,
+    ) -> Result<()> {
+        if !is_object_2001_tuple(expected_vendor_id, expected_product_code) {
+            return Err(device_operation_rejected(
+                nid,
+                "position preset is only supported for an exact known motor identity",
+            ));
+        }
         let pos = pos.clamp(-0.5, 0.5);
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "set_position_preset")?;
+        let (entry, session) = self.require_current_session_online(nid, false)?;
+        self.verify_identity_tuple_in_session(
+            nid,
+            &entry,
+            session,
+            false,
+            expected_vendor_id,
+            expected_product_code,
+        )
+        .await?;
         let timeout = Some(self.opts.sdo_timeout);
-        // 确保处于 Switch On Disabled（写控制字 0x0000 = Disable Voltage）
-        sdo::download_u16(self.bus.as_ref(), nid, 0x6040, 0, 0x0000, timeout).await?;
-        // 0x3001:01 期望位置 (REAL32, Rev)
-        sdo::download_f32(self.bus.as_ref(), nid, 0x3001, 1, pos, timeout).await?;
-        // 0x3001:02 = "pres" = 0x73657270 → 把当前位置设为 0x3001:01
-        sdo::download_u32(self.bus.as_ref(), nid, 0x3001, 2, 0x7365_7270, timeout).await?;
+        self.sdo_download_session_checked(
+            nid,
+            &entry,
+            session,
+            false,
+            &[SdoWrite::u16(0x6040, 0, 0x0000)],
+        )
+        .await?;
+
+        let deadline = Instant::now() + self.opts.mode_confirm_timeout;
+        loop {
+            self.ensure_device_session(nid, &entry, session, false)?;
+            let status_word =
+                sdo::upload_u16(self.bus.as_ref(), nid, 0x6041, 0, timeout).await?;
+            self.ensure_device_session(nid, &entry, session, false)?;
+            // CiA 402 Switch On Disabled uses mask 0x004F/value 0x0040.
+            // Bit 5 (Quick Stop) is not part of this state classification, so
+            // both device-reported 0x0250 and 0x0270 must be accepted.
+            if status_word & 0x004F == 0x0040 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::DeviceOperationTimeout {
+                    nid,
+                    operation: "waiting for Switch On Disabled before position preset",
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        self.sdo_download_session_checked(
+            nid,
+            &entry,
+            session,
+            false,
+            &[
+                SdoWrite::f32(0x3001, 1, pos),
+                SdoWrite::u32(0x3001, 2, 0x7365_7270),
+            ],
+        )
+        .await?;
         log::info!("nid 0x{nid:02X}: position preset -> {pos} Rev");
         Ok(())
     }
 
-    /// 按需读一次电机当前位置 `0x6064`（REAL32，单圈 Rev）。零点工具用——**只在
-    /// 发现/点按/保存后读，不轮询**（总线上电机可能随时掉电，避免无谓 TX）。
-    /// 不要求 Initialized。
-    pub async fn read_position(&self, nid: u8) -> Result<f32> {
+    /// 身份严格地按需读一次已知电机当前位置 `0x6064`。
+    pub async fn read_position_for(
+        &self,
+        nid: u8,
+        expected_vendor_id: u32,
+        expected_product_code: u32,
+    ) -> Result<f32> {
+        if !is_object_2001_tuple(expected_vendor_id, expected_product_code) {
+            return Err(device_operation_rejected(
+                nid,
+                "position read is only supported for an exact known motor identity",
+            ));
+        }
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "read_position")?;
-        sdo::upload_f32(self.bus.as_ref(), nid, 0x6064, 0, Some(self.opts.sdo_timeout)).await
+        let (entry, session) = self.require_current_session_online(nid, false)?;
+        self.verify_identity_tuple_in_session(
+            nid,
+            &entry,
+            session,
+            false,
+            expected_vendor_id,
+            expected_product_code,
+        )
+        .await?;
+        self.ensure_device_session(nid, &entry, session, false)?;
+        let position =
+            sdo::upload_f32(self.bus.as_ref(), nid, 0x6064, 0, Some(self.opts.sdo_timeout))
+                .await?;
+        self.ensure_device_session(nid, &entry, session, false)?;
+        Ok(position)
+    }
+
+    /// [`set_position_preset_for`](Self::set_position_preset_for) 的显式命名别名。
+    pub async fn set_position_preset_for_identity(
+        &self,
+        nid: u8,
+        expected_vendor_id: u32,
+        expected_product_code: u32,
+        pos: f32,
+    ) -> Result<()> {
+        self.set_position_preset_for(nid, expected_vendor_id, expected_product_code, pos)
+            .await
+    }
+
+    /// [`read_position_for`](Self::read_position_for) 的显式命名别名。
+    pub async fn read_position_for_identity(
+        &self,
+        nid: u8,
+        expected_vendor_id: u32,
+        expected_product_code: u32,
+    ) -> Result<f32> {
+        self.read_position_for(nid, expected_vendor_id, expected_product_code)
+            .await
+    }
+
+    /// 兼容旧调用方的位置预设；仍会从缓存取精确身份，并在写前强制重读 0x1018。
+    pub async fn set_position_preset(&self, nid: u8, pos: f32) -> Result<()> {
+        let (vendor_id, product_code) = self.cached_motor_identity_tuple(nid)?;
+        self.set_position_preset_for(nid, vendor_id, product_code, pos)
+            .await
+    }
+
+    /// 兼容旧调用方的按需位置读取；未知设备不会收到任何位置对象访问。
+    pub async fn read_position(&self, nid: u8) -> Result<f32> {
+        let (vendor_id, product_code) = self.cached_motor_identity_tuple(nid)?;
+        self.read_position_for(nid, vendor_id, product_code)
+            .await
     }
 
     /// 写 `0x6072`（Max Torque），限制**所有模式**下的最大力矩输出。
@@ -604,6 +824,356 @@ impl Cia402Manager {
             .clone()
     }
 
+    fn validate_settings_target(
+        &self,
+        nid: u8,
+        vendor_id: u32,
+        product_code: u32,
+        update: DeviceSettingsUpdate,
+    ) -> Result<()> {
+        if dialect_for_tuple(vendor_id, product_code).is_none() {
+            return Err(device_operation_rejected(
+                nid,
+                "the exact vendor/product tuple has no supported settings dialect",
+            ));
+        }
+        self.validate_node_id_target(nid, vendor_id, product_code, update.new_node_id)?;
+        if update.nominal_bitrate != 1_000_000 {
+            return Err(device_operation_rejected(
+                nid,
+                format!(
+                    "nominal bitrate must be 1000000, got {}",
+                    update.nominal_bitrate
+                ),
+            ));
+        }
+        if let Some(data_bitrate) = update.data_bitrate {
+            if !matches!(
+                data_bitrate,
+                1_000_000 | 2_000_000 | 4_000_000 | 5_000_000
+            ) {
+                return Err(device_operation_rejected(
+                    nid,
+                    format!(
+                        "data bitrate must be 1000000, 2000000, 4000000, or 5000000, \
+                         got {data_bitrate}"
+                    ),
+                ));
+            }
+        }
+        if update.data_bitrate.is_some() != update.transmit_pdo_brs.is_some() {
+            return Err(device_operation_rejected(
+                nid,
+                "data bitrate and TPDO BRS must either both be present or both be absent",
+            ));
+        }
+        if is_object_2001_tuple(vendor_id, product_code) && update.data_bitrate.is_none() {
+            return Err(device_operation_rejected(
+                nid,
+                "the exact motor dialect requires CAN FD data bitrate and TPDO BRS values",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_node_id_target(
+        &self,
+        nid: u8,
+        vendor_id: u32,
+        product_code: u32,
+        new_node_id: u8,
+    ) -> Result<()> {
+        if !(1..=126).contains(&new_node_id) || matches!(new_node_id, 100 | 101 | 127) {
+            return Err(device_operation_rejected(
+                nid,
+                format!(
+                    "new node ID must be 1..=126 and must not be 100, 101, or 127; \
+                     got {new_node_id}"
+                ),
+            ));
+        }
+        if new_node_id == self.opts.heartbeat_node_id {
+            return Err(device_operation_rejected(
+                nid,
+                format!(
+                    "new node ID {new_node_id} conflicts with the manager heartbeat node ID"
+                ),
+            ));
+        }
+        validate_role_node_id(vendor_id, product_code, new_node_id)
+            .map_err(|reason| device_operation_rejected(nid, reason))
+    }
+
+    fn reject_online_node_id_collision(&self, nid: u8, new_node_id: u8) -> Result<()> {
+        if new_node_id == nid {
+            return Ok(());
+        }
+        let conflict = self
+            .motors
+            .read()
+            .unwrap()
+            .get(&new_node_id)
+            .is_some_and(|entry| entry.inner.lock().unwrap().online);
+        if conflict {
+            return Err(device_operation_rejected(
+                nid,
+                format!("node ID {new_node_id} is already online"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 尚未发首帧心跳的节点可能不在 map 中；对目标 ID 做一次按需 0x1018 probe。
+    ///
+    /// 只有本地 SDO client 的明确 ProtocolTimeout 能证明“没有任何响应”。任何
+    /// 成功响应、server abort、其它协议错误或 transport 错误都保守拒绝。
+    async fn probe_target_node_id_available(&self, nid: u8, new_node_id: u8) -> Result<()> {
+        if new_node_id == nid {
+            return Ok(());
+        }
+        match sdo::upload_u32(
+            self.bus.as_ref(),
+            new_node_id,
+            0x1018,
+            1,
+            Some(self.opts.sdo_timeout),
+        )
+        .await
+        {
+            Ok(_) => Err(device_operation_rejected(
+                nid,
+                format!("target node ID {new_node_id} responded to 0x1018 and is occupied"),
+            )),
+            Err(Error::Sdo(AsyncSdoError::Sdo(SdoError::ClientAborted(
+                SdoAbortCode::ProtocolTimeout,
+            )))) => Ok(()),
+            Err(Error::Sdo(AsyncSdoError::Sdo(SdoError::ServerAborted(code)))) => {
+                Err(device_operation_rejected(
+                    nid,
+                    format!(
+                        "target node ID {new_node_id} returned SDO abort {code} and is occupied"
+                    ),
+                ))
+            }
+            Err(error) => Err(device_operation_rejected(
+                nid,
+                format!(
+                    "could not safely prove target node ID {new_node_id} is free: {error}"
+                ),
+            )),
+        }
+    }
+
+    fn require_current_session_online(
+        &self,
+        nid: u8,
+        require_configuration_nmt_state: bool,
+    ) -> Result<(Arc<MotorEntry>, DeviceSessionToken)> {
+        let entry = self
+            .motors
+            .read()
+            .unwrap()
+            .get(&nid)
+            .cloned()
+            .ok_or_else(|| {
+                device_operation_rejected(nid, "node has not sent a heartbeat in this session")
+            })?;
+        let inner = entry.inner.lock().unwrap();
+        if !inner.online || inner.last_heartbeat.is_none() || inner.nmt_state.is_none() {
+            return Err(device_operation_rejected(
+                nid,
+                "node has not sent a current-session heartbeat or is offline",
+            ));
+        }
+        if require_configuration_nmt_state
+            && !matches!(
+                inner.nmt_state,
+                Some(NmtState::PreOperational | NmtState::Stopped)
+            )
+        {
+            return Err(device_operation_rejected(
+                nid,
+                format!(
+                    "communication settings require Pre-Operational or Stopped, got {:?}",
+                    inner.nmt_state
+                ),
+            ));
+        }
+        let token = DeviceSessionToken {
+            session_epoch: inner.session_epoch,
+            nmt_revision: inner.nmt_revision,
+            nmt_state: inner.nmt_state.expect("checked above"),
+        };
+        drop(inner);
+        Ok((entry, token))
+    }
+
+    fn ensure_device_session(
+        &self,
+        nid: u8,
+        entry: &MotorEntry,
+        expected: DeviceSessionToken,
+        require_configuration_nmt_state: bool,
+    ) -> Result<()> {
+        let inner = entry.inner.lock().unwrap();
+        if !inner.online || inner.last_heartbeat.is_none() {
+            return Err(device_operation_rejected(
+                nid,
+                "device went offline during the operation",
+            ));
+        }
+        if inner.session_epoch != expected.session_epoch {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed during the operation",
+            ));
+        }
+        if inner.nmt_revision != expected.nmt_revision
+            || inner.nmt_state != Some(expected.nmt_state)
+        {
+            return Err(device_operation_rejected(
+                nid,
+                "device NMT state changed during the operation",
+            ));
+        }
+        if require_configuration_nmt_state
+            && !matches!(
+                inner.nmt_state,
+                Some(NmtState::PreOperational | NmtState::Stopped)
+            )
+        {
+            return Err(device_operation_rejected(
+                nid,
+                "device left Pre-Operational/Stopped during the settings transaction",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_identity_tuple_in_session(
+        &self,
+        nid: u8,
+        entry: &MotorEntry,
+        session: DeviceSessionToken,
+        require_configuration_nmt_state: bool,
+        expected_vendor_id: u32,
+        expected_product_code: u32,
+    ) -> Result<()> {
+        let timeout = Some(self.opts.sdo_timeout);
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )?;
+        let actual_vendor_id =
+            sdo::upload_u32(self.bus.as_ref(), nid, 0x1018, 1, timeout).await?;
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )?;
+        let actual_product_code =
+            sdo::upload_u32(self.bus.as_ref(), nid, 0x1018, 2, timeout).await?;
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )?;
+        if actual_vendor_id != expected_vendor_id || actual_product_code != expected_product_code {
+            return Err(device_operation_rejected(
+                nid,
+                format!(
+                    "identity changed: expected 0x{expected_vendor_id:08X}/\
+                     0x{expected_product_code:08X}, got 0x{actual_vendor_id:08X}/\
+                     0x{actual_product_code:08X}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn read_current_settings(
+        &self,
+        nid: u8,
+        vendor_id: u32,
+        product_code: u32,
+    ) -> Result<DeviceSettingsSnapshot> {
+        read_device_settings_snapshot(
+            self.bus.as_ref(),
+            nid,
+            vendor_id,
+            product_code,
+            self.opts.sdo_timeout,
+        )
+        .await
+        .map_err(|reason| device_operation_rejected(nid, reason))
+    }
+
+    fn cache_applied_settings(
+        &self,
+        nid: u8,
+        entry: &MotorEntry,
+        session: DeviceSessionToken,
+        update: DeviceSettingsUpdate,
+    ) -> Result<()> {
+        let mut inner = entry.inner.lock().unwrap();
+        if !inner.online
+            || inner.session_epoch != session.session_epoch
+            || inner.nmt_revision != session.nmt_revision
+            || inner.nmt_state != Some(session.nmt_state)
+        {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed before applied settings could be cached",
+            ));
+        }
+        inner.can_config = DeviceCanConfigStatus::Available(DeviceCanConfig {
+            stored_node_id: update.new_node_id,
+            nominal_bitrate: update.nominal_bitrate,
+            data_bitrate: update.data_bitrate,
+            transmit_pdo_brs: update.transmit_pdo_brs,
+        });
+        Ok(())
+    }
+
+    fn cached_supported_identity_tuple(&self, nid: u8) -> Result<(u32, u32)> {
+        let entry = self
+            .motors
+            .read()
+            .unwrap()
+            .get(&nid)
+            .cloned()
+            .ok_or_else(|| device_operation_rejected(nid, "node is not known"))?;
+        let identity = entry
+            .inner
+            .lock()
+            .unwrap()
+            .identity
+            .clone()
+            .ok_or_else(|| device_operation_rejected(nid, "exact identity is not available"))?;
+        if dialect_for_tuple(identity.vendor_id, identity.product_code).is_none() {
+            return Err(device_operation_rejected(
+                nid,
+                "cached exact identity has no supported settings dialect",
+            ));
+        }
+        Ok((identity.vendor_id, identity.product_code))
+    }
+
+    fn cached_motor_identity_tuple(&self, nid: u8) -> Result<(u32, u32)> {
+        let (vendor_id, product_code) = self.cached_supported_identity_tuple(nid)?;
+        if !is_object_2001_tuple(vendor_id, product_code) {
+            return Err(device_operation_rejected(
+                nid,
+                "position operations require an exact known motor identity",
+            ));
+        }
+        Ok((vendor_id, product_code))
+    }
+
     /// 拿到 lifecycle == Initialized 的 entry，否则返回 NotReady。
     fn require_initialized(&self, nid: u8) -> Result<Arc<MotorEntry>> {
         let g = self.motors.read().unwrap();
@@ -645,6 +1215,70 @@ impl Cia402Manager {
             }
         }
         Ok(())
+    }
+
+    /// 顺序写设置对象，并在每条 SDO 前后核对同一设备 session / NMT revision。
+    async fn sdo_download_session_checked(
+        &self,
+        nid: u8,
+        entry: &MotorEntry,
+        session: DeviceSessionToken,
+        require_configuration_nmt_state: bool,
+        writes: &[SdoWrite],
+    ) -> Result<()> {
+        let sdo_timeout = Some(self.opts.sdo_timeout);
+        let last = writes.len().saturating_sub(1);
+        for (i, write) in writes.iter().enumerate() {
+            self.ensure_device_session(
+                nid,
+                entry,
+                session,
+                require_configuration_nmt_state,
+            )?;
+            sdo::download(
+                self.bus.as_ref(),
+                nid,
+                write.index,
+                write.subindex,
+                &write.data,
+                sdo_timeout,
+            )
+            .await?;
+            self.ensure_device_session(
+                nid,
+                entry,
+                session,
+                require_configuration_nmt_state,
+            )?;
+            if i != last {
+                tokio::time::sleep(INTER_WRITE_DELAY).await;
+            }
+        }
+        self.ensure_device_session(
+            nid,
+            entry,
+            session,
+            require_configuration_nmt_state,
+        )
+    }
+}
+
+fn update_with_new_node_id(
+    current: &DeviceSettingsSnapshot,
+    new_node_id: u8,
+) -> DeviceSettingsUpdate {
+    DeviceSettingsUpdate {
+        new_node_id,
+        nominal_bitrate: current.config.nominal_bitrate,
+        data_bitrate: current.config.data_bitrate,
+        transmit_pdo_brs: current.config.transmit_pdo_brs,
+    }
+}
+
+fn device_operation_rejected(nid: u8, reason: impl Into<String>) -> Error {
+    Error::DeviceOperationRejected {
+        nid,
+        reason: reason.into(),
     }
 }
 
@@ -702,5 +1336,819 @@ impl Drop for Cia402Manager {
         for h in self.tasks.drain(..) {
             h.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use can_transport::{
+        CanCapabilities, CanFilter, CanFrame, CanId, CanIoError, CanRx,
+    };
+    use tokio::sync::mpsc;
+
+    const MOTOR_VENDOR: u32 = 0x4859_444C;
+    const MOTOR_PRODUCT: u32 = 0xAAAA_0001;
+    type SdoKey = (u8, u16, u8);
+    type ScriptedValue = (SdoKey, Vec<Vec<u8>>);
+    type SendHook = Arc<dyn Fn(u8, &RecordedSdo) + Send + Sync>;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedSdo {
+        Upload {
+            index: u16,
+            subindex: u8,
+        },
+        Download {
+            index: u16,
+            subindex: u8,
+            data: Vec<u8>,
+        },
+    }
+
+    struct ScriptedSettingsBus {
+        values: Mutex<HashMap<SdoKey, VecDeque<Vec<u8>>>>,
+        requests: Mutex<Vec<RecordedSdo>>,
+        response_tx: Mutex<Option<mpsc::UnboundedSender<CanFrame>>>,
+        send_hook: Mutex<Option<SendHook>>,
+    }
+
+    impl ScriptedSettingsBus {
+        fn new<const N: usize>(values: [ScriptedValue; N]) -> Self {
+            Self {
+                values: Mutex::new(
+                    values
+                        .into_iter()
+                        .map(|(key, values)| (key, values.into()))
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+                response_tx: Mutex::new(None),
+                send_hook: Mutex::new(None),
+            }
+        }
+
+        fn requests(&self) -> Vec<RecordedSdo> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn set_send_hook(&self, hook: SendHook) {
+            *self.send_hook.lock().unwrap() = Some(hook);
+        }
+
+        fn record(&self, nid: u8, request: RecordedSdo) {
+            self.requests.lock().unwrap().push(request.clone());
+            let hook = self.send_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(nid, &request);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CanBus for ScriptedSettingsBus {
+        async fn send(&self, frame: CanFrame) -> std::result::Result<(), CanIoError> {
+            let request = frame.data();
+            if request.len() != 8 {
+                return Err(CanIoError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "test bus expected an 8-byte expedited SDO request",
+                )));
+            }
+            let nid = match frame.id() {
+                CanId::Standard(id) if (0x601..=0x67F).contains(&id) => (id - 0x600) as u8,
+                _ => {
+                    return Err(CanIoError::backend(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "test bus received an invalid RSDO COB-ID",
+                    )))
+                }
+            };
+            let index = u16::from_le_bytes([request[1], request[2]]);
+            let subindex = request[3];
+            let mut response = [0u8; 8];
+            response[1] = request[1];
+            response[2] = request[2];
+            response[3] = subindex;
+
+            if request[0] == 0x40 {
+                self.record(nid, RecordedSdo::Upload { index, subindex });
+                let value = {
+                    let mut values = self.values.lock().unwrap();
+                    let queue = values.get_mut(&(nid, index, subindex)).ok_or_else(|| {
+                        CanIoError::backend(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "unexpected test upload nid {nid} 0x{index:04X}:{subindex:02X}"
+                            ),
+                        ))
+                    })?;
+                    if queue.is_empty() {
+                        // Deliberately silent node: drive the SDO client to ProtocolTimeout.
+                        return Ok(());
+                    }
+                    if queue.len() > 1 {
+                        queue.pop_front().unwrap()
+                    } else {
+                        queue.front().cloned().unwrap()
+                    }
+                };
+                if !(1..=4).contains(&value.len()) {
+                    return Err(CanIoError::backend(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "test upload value must contain 1..=4 bytes",
+                    )));
+                }
+                response[0] = 0x43 | (((4 - value.len()) as u8) << 2);
+                response[4..4 + value.len()].copy_from_slice(&value);
+            } else if request[0] & 0xE0 == 0x20 && request[0] & 0x02 != 0 {
+                let unused = ((request[0] >> 2) & 0x03) as usize;
+                let len = 4 - unused;
+                self.record(
+                    nid,
+                    RecordedSdo::Download {
+                        index,
+                        subindex,
+                        data: request[4..4 + len].to_vec(),
+                    },
+                );
+                response[0] = 0x60;
+            } else {
+                return Err(CanIoError::backend(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unexpected SDO command 0x{:02X}", request[0]),
+                )));
+            }
+
+            let response = CanFrame::new_data(0x580u16 + nid as u16, &response)?;
+            self.response_tx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .ok_or(CanIoError::Disconnected)?
+                .send(response)
+                .map_err(|_| CanIoError::Disconnected)
+        }
+
+        async fn subscribe(
+            &self,
+            _filter: CanFilter,
+        ) -> std::result::Result<Box<dyn CanRx>, CanIoError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.response_tx.lock().unwrap() = Some(tx);
+            Ok(Box::new(ScriptedSettingsRx { rx }))
+        }
+
+        fn capabilities(&self) -> CanCapabilities {
+            CanCapabilities {
+                fd: true,
+                max_dlen: 64,
+            }
+        }
+    }
+
+    struct ScriptedSettingsRx {
+        rx: mpsc::UnboundedReceiver<CanFrame>,
+    }
+
+    #[async_trait]
+    impl CanRx for ScriptedSettingsRx {
+        async fn recv(&mut self) -> std::result::Result<CanFrame, CanIoError> {
+            self.rx.recv().await.ok_or(CanIoError::Disconnected)
+        }
+
+        fn try_recv(&mut self) -> std::result::Result<Option<CanFrame>, CanIoError> {
+            match self.rx.try_recv() {
+                Ok(frame) => Ok(Some(frame)),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(CanIoError::Disconnected),
+            }
+        }
+    }
+
+    fn test_manager(bus: Arc<dyn CanBus>) -> Cia402Manager {
+        let (events_tx, _) = broadcast::channel(4);
+        let opts = Cia402ManagerOptions {
+            broadcast_heartbeat: false,
+            sdo_timeout: Duration::from_millis(50),
+            mode_confirm_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        Cia402Manager {
+            bus,
+            opts,
+            motors: Arc::new(RwLock::new(HashMap::new())),
+            inflight_ops: Arc::new(StdMutex::new(HashSet::new())),
+            events_tx,
+            cancel: CancellationToken::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn add_online_entry(
+        manager: &Cia402Manager,
+        nid: u8,
+        vendor_id: u32,
+        product_code: u32,
+        nmt_state: NmtState,
+    ) {
+        let entry = Arc::new(MotorEntry::new(nid));
+        {
+            let mut inner = entry.inner.lock().unwrap();
+            inner.identity = Some(crate::types::MotorIdentity {
+                node_id: nid,
+                vendor_id,
+                product_code,
+                revision_number: 0,
+                serial_number: 0,
+                product_name: None,
+            });
+            inner.lifecycle = MotorLifecycle::Identified;
+            inner.online = true;
+            inner.last_heartbeat = Some(Instant::now());
+            inner.nmt_state = Some(nmt_state);
+        }
+        manager.motors.write().unwrap().insert(nid, entry);
+    }
+
+    fn entry(manager: &Cia402Manager, nid: u8) -> Arc<MotorEntry> {
+        manager.motors.read().unwrap()[&nid].clone()
+    }
+
+    fn motor_settings_values(
+        node_id: u8,
+        data_bitrate: u32,
+        brs: bool,
+    ) -> [ScriptedValue; 8] {
+        [
+            ((1, 0x1018, 1), vec![MOTOR_VENDOR.to_le_bytes().to_vec()]),
+            ((1, 0x1018, 2), vec![MOTOR_PRODUCT.to_le_bytes().to_vec()]),
+            ((1, 0x2001, 0), vec![vec![4]]),
+            ((1, 0x2001, 1), vec![vec![node_id]]),
+            (
+                (1, 0x2001, 2),
+                vec![1_000_000u32.to_le_bytes().to_vec()],
+            ),
+            (
+                (1, 0x2001, 3),
+                vec![data_bitrate.to_le_bytes().to_vec()],
+            ),
+            ((1, 0x2001, 4), vec![vec![u8::from(brs)]]),
+            ((42, 0x1018, 1), vec![]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn settings_transaction_rechecks_identity_and_writes_motor_fields_in_order() {
+        let bus = Arc::new(ScriptedSettingsBus::new(motor_settings_values(
+            1, 5_000_000, false,
+        )));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::PreOperational,
+        );
+
+        let result = manager
+            .apply_device_settings(
+                1,
+                MOTOR_VENDOR,
+                MOTOR_PRODUCT,
+                DeviceSettingsUpdate {
+                    new_node_id: 42,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(2_000_000),
+                    transmit_pdo_brs: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.changed);
+        assert!(result.restart_required);
+        assert_eq!(
+            manager.list()[0].can_config,
+            DeviceCanConfigStatus::Available(DeviceCanConfig {
+                stored_node_id: 42,
+                nominal_bitrate: 1_000_000,
+                data_bitrate: Some(2_000_000),
+                transmit_pdo_brs: Some(true),
+            })
+        );
+        assert_eq!(
+            bus.requests(),
+            vec![
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 1,
+                },
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 2,
+                },
+                RecordedSdo::Upload {
+                    index: 0x2001,
+                    subindex: 0,
+                },
+                RecordedSdo::Upload {
+                    index: 0x2001,
+                    subindex: 1,
+                },
+                RecordedSdo::Upload {
+                    index: 0x2001,
+                    subindex: 2,
+                },
+                RecordedSdo::Upload {
+                    index: 0x2001,
+                    subindex: 3,
+                },
+                RecordedSdo::Upload {
+                    index: 0x2001,
+                    subindex: 4,
+                },
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 1,
+                },
+                RecordedSdo::Download {
+                    index: 0x2001,
+                    subindex: 3,
+                    data: 2_000_000u32.to_le_bytes().to_vec(),
+                },
+                RecordedSdo::Download {
+                    index: 0x2001,
+                    subindex: 4,
+                    data: vec![1],
+                },
+                RecordedSdo::Download {
+                    index: 0x2001,
+                    subindex: 1,
+                    data: vec![42],
+                },
+                RecordedSdo::Download {
+                    index: 0x1010,
+                    subindex: 1,
+                    data: 0x6576_6173u32.to_le_bytes().to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn target_node_probe_only_treats_explicit_protocol_timeout_as_free() {
+        let free_bus = Arc::new(ScriptedSettingsBus::new([((42, 0x1018, 1), vec![])]));
+        let free_manager = test_manager(free_bus);
+        free_manager
+            .probe_target_node_id_available(1, 42)
+            .await
+            .unwrap();
+
+        let occupied_bus = Arc::new(ScriptedSettingsBus::new([(
+            (42, 0x1018, 1),
+            vec![0x1234_5678u32.to_le_bytes().to_vec()],
+        )]));
+        let occupied_manager = test_manager(occupied_bus);
+        let occupied = occupied_manager
+            .probe_target_node_id_available(1, 42)
+            .await
+            .unwrap_err();
+        assert!(occupied.to_string().contains("responded"));
+        assert!(occupied.to_string().contains("occupied"));
+
+        let uncertain_bus = Arc::new(ScriptedSettingsBus::new([]));
+        let uncertain_manager = test_manager(uncertain_bus);
+        let uncertain = uncertain_manager
+            .probe_target_node_id_available(1, 42)
+            .await
+            .unwrap_err();
+        assert!(uncertain.to_string().contains("could not safely prove"));
+    }
+
+    #[tokio::test]
+    async fn settings_epoch_change_during_forced_read_blocks_all_writes() {
+        let bus = Arc::new(ScriptedSettingsBus::new(motor_settings_values(
+            1, 5_000_000, false,
+        )));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::PreOperational,
+        );
+        let active_entry = entry(&manager, 1);
+        bus.set_send_hook(Arc::new(move |nid, request| {
+            if nid == 1
+                && matches!(
+                    request,
+                    RecordedSdo::Upload {
+                        index: 0x2001,
+                        subindex: 4
+                    }
+                )
+            {
+                active_entry.inner.lock().unwrap().session_epoch += 1;
+            }
+        }));
+
+        let error = manager
+            .apply_device_settings(
+                1,
+                MOTOR_VENDOR,
+                MOTOR_PRODUCT,
+                DeviceSettingsUpdate {
+                    new_node_id: 42,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(2_000_000),
+                    transmit_pdo_brs: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("session changed"));
+        assert!(!bus
+            .requests()
+            .iter()
+            .any(|request| matches!(request, RecordedSdo::Download { .. })));
+    }
+
+    #[tokio::test]
+    async fn settings_nmt_change_after_first_write_stops_remaining_writes_and_keeps_cache() {
+        let bus = Arc::new(ScriptedSettingsBus::new(motor_settings_values(
+            1, 5_000_000, false,
+        )));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::PreOperational,
+        );
+        let active_entry = entry(&manager, 1);
+        {
+            active_entry.inner.lock().unwrap().can_config =
+                DeviceCanConfigStatus::Available(DeviceCanConfig {
+                    stored_node_id: 1,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(5_000_000),
+                    transmit_pdo_brs: Some(false),
+                });
+        }
+        let hook_entry = active_entry.clone();
+        bus.set_send_hook(Arc::new(move |nid, request| {
+            if nid == 1 && matches!(request, RecordedSdo::Download { .. }) {
+                let mut inner = hook_entry.inner.lock().unwrap();
+                if inner.nmt_state != Some(NmtState::Operational) {
+                    inner.nmt_state = Some(NmtState::Operational);
+                    inner.nmt_revision += 1;
+                }
+            }
+        }));
+
+        let error = manager
+            .apply_device_settings(
+                1,
+                MOTOR_VENDOR,
+                MOTOR_PRODUCT,
+                DeviceSettingsUpdate {
+                    new_node_id: 1,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(2_000_000),
+                    transmit_pdo_brs: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("NMT state changed"));
+        assert_eq!(
+            bus.requests()
+                .iter()
+                .filter(|request| matches!(request, RecordedSdo::Download { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            active_entry.inner.lock().unwrap().can_config,
+            DeviceCanConfigStatus::Available(DeviceCanConfig {
+                stored_node_id: 1,
+                nominal_bitrate: 1_000_000,
+                data_bitrate: Some(5_000_000),
+                transmit_pdo_brs: Some(false),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn object_2100_noop_apply_rewrites_full_target_and_updates_cache() {
+        const VENDOR: u32 = 0x6865_786D;
+        const PRODUCT: u32 = 0x6169_6D75;
+        let bus = Arc::new(ScriptedSettingsBus::new([
+            ((31, 0x1018, 1), vec![VENDOR.to_le_bytes().to_vec()]),
+            ((31, 0x1018, 2), vec![PRODUCT.to_le_bytes().to_vec()]),
+            ((31, 0x2100, 0), vec![vec![3]]),
+            ((31, 0x2101, 0), vec![vec![31]]),
+            (
+                (31, 0x2100, 1),
+                vec![1_000_000u32.to_le_bytes().to_vec()],
+            ),
+            (
+                (31, 0x2100, 2),
+                vec![4_000_000u32.to_le_bytes().to_vec()],
+            ),
+            ((31, 0x2100, 3), vec![vec![1]]),
+        ]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(&manager, 31, VENDOR, PRODUCT, NmtState::Stopped);
+
+        let result = manager
+            .apply_device_settings(
+                31,
+                VENDOR,
+                PRODUCT,
+                DeviceSettingsUpdate {
+                    new_node_id: 31,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(4_000_000),
+                    transmit_pdo_brs: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            DeviceSettingsResult {
+                changed: false,
+                restart_required: true,
+                persistence_pending: true,
+                brs_applied_immediately: false,
+            }
+        );
+        assert_eq!(
+            bus.requests()
+                .into_iter()
+                .filter(|request| matches!(request, RecordedSdo::Download { .. }))
+                .collect::<Vec<_>>(),
+            vec![
+                RecordedSdo::Download {
+                    index: 0x2100,
+                    subindex: 1,
+                    data: 1_000_000u32.to_le_bytes().to_vec(),
+                },
+                RecordedSdo::Download {
+                    index: 0x2100,
+                    subindex: 2,
+                    data: 4_000_000u32.to_le_bytes().to_vec(),
+                },
+                RecordedSdo::Download {
+                    index: 0x2100,
+                    subindex: 3,
+                    data: vec![1],
+                },
+                RecordedSdo::Download {
+                    index: 0x2101,
+                    subindex: 0,
+                    data: vec![31],
+                },
+            ]
+        );
+        assert_eq!(
+            entry(&manager, 31).inner.lock().unwrap().can_config,
+            DeviceCanConfigStatus::Available(DeviceCanConfig {
+                stored_node_id: 31,
+                nominal_bitrate: 1_000_000,
+                data_bitrate: Some(4_000_000),
+                transmit_pdo_brs: Some(true),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_rejects_operational_state_without_sending_any_sdo() {
+        let bus = Arc::new(ScriptedSettingsBus::new([]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::Operational,
+        );
+
+        let error = manager
+            .apply_device_settings(
+                1,
+                MOTOR_VENDOR,
+                MOTOR_PRODUCT,
+                DeviceSettingsUpdate {
+                    new_node_id: 42,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(5_000_000),
+                    transmit_pdo_brs: Some(false),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Pre-Operational or Stopped"));
+        assert!(bus.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_aborts_before_config_probe_or_write() {
+        let bus = Arc::new(ScriptedSettingsBus::new([
+            ((1, 0x1018, 1), vec![MOTOR_VENDOR.to_le_bytes().to_vec()]),
+            (
+                (1, 0x1018, 2),
+                vec![0xAAAA_0002u32.to_le_bytes().to_vec()],
+            ),
+        ]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::Stopped,
+        );
+
+        let error = manager
+            .apply_device_settings(
+                1,
+                MOTOR_VENDOR,
+                MOTOR_PRODUCT,
+                DeviceSettingsUpdate {
+                    new_node_id: 42,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(5_000_000),
+                    transmit_pdo_brs: Some(false),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(
+            bus.requests(),
+            vec![
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 1,
+                },
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 2,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_position_preset_waits_for_switch_on_disabled() {
+        let bus = Arc::new(ScriptedSettingsBus::new([
+            ((1, 0x1018, 1), vec![MOTOR_VENDOR.to_le_bytes().to_vec()]),
+            ((1, 0x1018, 2), vec![MOTOR_PRODUCT.to_le_bytes().to_vec()]),
+            (
+                (1, 0x6041, 0),
+                vec![
+                    0x0021u16.to_le_bytes().to_vec(),
+                    0x0270u16.to_le_bytes().to_vec(),
+                ],
+            ),
+        ]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::Operational,
+        );
+
+        manager
+            .set_position_preset_for(1, MOTOR_VENDOR, MOTOR_PRODUCT, 0.25)
+            .await
+            .unwrap();
+
+        let requests = bus.requests();
+        assert_eq!(
+            &requests[0..3],
+            &[
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 1,
+                },
+                RecordedSdo::Upload {
+                    index: 0x1018,
+                    subindex: 2,
+                },
+                RecordedSdo::Download {
+                    index: 0x6040,
+                    subindex: 0,
+                    data: 0u16.to_le_bytes().to_vec(),
+                },
+            ]
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        request,
+                        RecordedSdo::Upload {
+                            index: 0x6041,
+                            subindex: 0
+                        }
+                    )
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            &requests[requests.len() - 2..],
+            &[
+                RecordedSdo::Download {
+                    index: 0x3001,
+                    subindex: 1,
+                    data: 0.25f32.to_le_bytes().to_vec(),
+                },
+                RecordedSdo::Download {
+                    index: 0x3001,
+                    subindex: 2,
+                    data: 0x7365_7270u32.to_le_bytes().to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn position_session_change_after_identity_blocks_first_position_sdo() {
+        let bus = Arc::new(ScriptedSettingsBus::new([
+            ((1, 0x1018, 1), vec![MOTOR_VENDOR.to_le_bytes().to_vec()]),
+            ((1, 0x1018, 2), vec![MOTOR_PRODUCT.to_le_bytes().to_vec()]),
+        ]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::Operational,
+        );
+        let active_entry = entry(&manager, 1);
+        bus.set_send_hook(Arc::new(move |nid, request| {
+            if nid == 1
+                && matches!(
+                    request,
+                    RecordedSdo::Upload {
+                        index: 0x1018,
+                        subindex: 2
+                    }
+                )
+            {
+                active_entry.inner.lock().unwrap().session_epoch += 1;
+            }
+        }));
+
+        let error = manager
+            .set_position_preset_for(1, MOTOR_VENDOR, MOTOR_PRODUCT, 0.0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session changed"));
+        assert!(!bus
+            .requests()
+            .iter()
+            .any(|request| matches!(request, RecordedSdo::Download { .. })));
+    }
+
+    #[tokio::test]
+    async fn strict_position_operation_rejects_unknown_tuple_without_sdo() {
+        let bus = Arc::new(ScriptedSettingsBus::new([]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(
+            &manager,
+            1,
+            0xDEAD_BEEF,
+            0xCAFE_BABE,
+            NmtState::PreOperational,
+        );
+
+        let error = manager
+            .read_position_for(1, 0xDEAD_BEEF, 0xCAFE_BABE)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exact known motor identity"));
+        assert!(bus.requests().is_empty());
     }
 }

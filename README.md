@@ -7,7 +7,7 @@
 
 ```toml
 [dependencies]
-hex-motor    = "0.1"
+hex-motor    = "0.2"
 can-transport = { version = "0.1", features = ["socketcan"] }
 tokio         = { version = "1", features = ["full"] }
 ```
@@ -165,6 +165,50 @@ let snap: LiveState = mgr.status(nid);             // ArcSwap 无锁快照
 let stream = mgr.subscribe_status(nid, opts)?;     // mpsc 流，per-subscriber 容量
 ```
 
+### 身份严格的设备设置 API
+
+配置工具应使用完整身份参数，而不是仅凭 vendor ID 或缓存猜对象字典：
+
+```rust
+use hex_motor::cia402::DeviceSettingsUpdate;
+
+let result = mgr.apply_device_settings(
+    nid,
+    expected_vendor_id,
+    expected_product_code,
+    DeviceSettingsUpdate {
+        new_node_id: 42,
+        nominal_bitrate: 1_000_000,
+        data_bitrate: Some(5_000_000),
+        transmit_pdo_brs: Some(true),
+    },
+).await?;
+```
+
+该事务只接受本次会话已收到心跳、NMT 为 Pre-Operational 或 Stopped 的节点。
+它会在同一独占区内强制重读 `0x1018` 和当前配置形状，精确匹配身份后才按对应
+对象字典按设备对应的持久化协议写入目标配置；未知身份、在线 Node-ID 冲突和非标准波特率都会在写前拒绝。
+若目标 Node-ID 与活动 ID 不同，还会按需 probe 目标的 `0x1018`；只有明确的
+SDO protocol timeout 才视为空闲，其它响应、abort 或传输错误都会保守拒绝。
+驱动不会主动发送 NMT、复位或重试。纯配置程序应设置
+`Cia402ManagerOptions::broadcast_heartbeat = false`，只在设备心跳或用户点击后
+发起通信。
+
+`MotorInfo::session_epoch` 在 Boot-Up 或 online→offline 边沿递增。设置和位置
+事务会在每个关键 SDO 前后核对 epoch 与 NMT revision，设备重启、掉线或切换
+NMT 状态后不会继续扩大部分写。成功 Apply 会直接把目标 working-copy 写回
+`MotorInfo::can_config`，不额外主动读取设备。
+
+`DeviceCanConfig::stored_node_id` 是对象字典里保存、等待重启生效的 ID，不一定
+等于当前活动 COB-ID；配置 UI 应用它预填目标 ID。0x2100 write-through 设备的
+显式 Apply 会按 `nominal → data/BRS（FD 时）→ node ID` 完整重写，即使值相同
+也重新触发持久化；此时 `changed == false` 只表示值无差异，仍会保守报告需要
+重启且持久化可能尚在排队。
+
+电机零点工具使用 `set_position_preset_for(...)` / `read_position_for(...)`。
+两者同样会强制重读身份；位置预设还会在写 `"pres"` 前轮询确认
+Switch On Disabled。旧的无身份参数方法只为兼容保留，也不会对未知身份试写。
+
 ### v0.1 控制范围（HexMeow CiA402 电机约定）
 
 | 模式                  | `set_mode` | `set_target(...)` 行为                                                                                                                    |
@@ -247,7 +291,8 @@ KnownDevice {
 不能只凭 vendor ID 推断产品、对象字典或展示名称。
 
 身份识别成功后，Manager 会按精确 `(vendor_id, product_code)` 方言读取一次设备
-CAN 配置，并缓存到 `MotorInfo::can_config`。驱动只报告设备值和读取状态，
+CAN 配置（包含对象字典保存的 Node-ID），并缓存到 `MotorInfo::can_config`。
+驱动只报告设备值和读取状态，
 不判断其是否符合主机或应用策略；未知产品也不会被试探性读取 vendor 对象。
 
 ---

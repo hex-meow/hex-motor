@@ -5,6 +5,8 @@
 /// 从设备对象字典读取到的 CAN 配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCanConfig {
+    /// 对象字典里保存的 Node-ID。它可能等待重启，因此不一定等于当前活动 COB-ID。
+    pub stored_node_id: u8,
     /// 仲裁段波特率，单位 bit/s。
     pub nominal_bitrate: u32,
     /// 数据段波特率，单位 bit/s。

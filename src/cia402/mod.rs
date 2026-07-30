@@ -32,6 +32,7 @@ pub use initialize::{
     DEFAULT_TPDO2_COMM, DEFAULT_TPDO2_ENTRIES,
 };
 pub use manager::{Cia402Manager, Cia402ManagerOptions};
+pub use crate::types::{DeviceSettingsResult, DeviceSettingsUpdate};
 pub use subscribe::{
     OverflowPolicy, StatusStream, StatusStreamItem, StreamOptions, DEFAULT_STREAM_CAPACITY,
 };

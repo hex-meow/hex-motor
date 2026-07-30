@@ -17,7 +17,7 @@ use super::device_can::{
     begin_device_can_config_read, finish_device_can_config_read, read_device_can_config,
 };
 use super::events::Cia402Event;
-use super::motor_entry::MotorEntry;
+use super::motor_entry::{AutoIdentifyState, MotorEntry, MotorEntryInner};
 use super::types::{MotorLifecycle, ReinitReason};
 
 /// 0x700..=0x77F：所有节点的入向心跳。
@@ -114,14 +114,23 @@ fn handle_inbound_hb(
     }
 
     // 更新可变状态。
-    let needs_identify;
+    let identify_attempt;
     let needs_reinit_event;
     let needs_online_event;
     let live_state;
     {
         let mut inner = entry.inner.lock().unwrap();
         inner.last_heartbeat = Some(now);
+        if inner.nmt_state != Some(state) {
+            inner.nmt_revision = inner.nmt_revision.wrapping_add(1);
+        }
         inner.nmt_state = Some(state);
+
+        // 快速重启可能短于 offline 阈值。Boot-Up 本身就是新会话的强信号，
+        // 必须立即丢弃旧身份/配置，不能等 liveness monitor 判离线。
+        if state == nmt::NmtState::BootUp {
+            invalidate_for_new_device_session(&mut inner);
+        }
 
         // 在线 edge：新出现 / 之前 offline → 现在 online
         needs_online_event = !inner.online;
@@ -139,8 +148,16 @@ fn handle_inbound_hb(
             false
         };
 
-        // identify 触发条件：lifecycle 还是 Unknown
-        needs_identify = matches!(inner.lifecycle, MotorLifecycle::Unknown);
+        // 每个 session 最多真正启动一次自动识别。inflight 忙时保留 Ready；
+        // 后续心跳只会重查本地锁，不发 CAN，直到能启动那唯一一次 SDO 序列。
+        identify_attempt = if matches!(inner.lifecycle, MotorLifecycle::Unknown) {
+            match inner.auto_identify_state {
+                AutoIdentifyState::Ready => Some(inner.session_epoch),
+                AutoIdentifyState::Attempted => None,
+            }
+        } else {
+            None
+        };
 
         live_state = inner.build_live_state(now);
     }
@@ -158,33 +175,60 @@ fn handle_inbound_hb(
     // 推给 status() / subscribe_status() —— last_heartbeat / nmt_state / online 都变了。
     entry.publish(live_state);
 
-    if needs_identify {
-        spawn_identify_if_idle(
+    if let Some(session_epoch) = identify_attempt {
+        let started = spawn_identify_if_idle(
             nid,
-            entry,
+            entry.clone(),
+            session_epoch,
             inflight_ops.clone(),
             events_tx.clone(),
             bus.clone(),
             sdo_timeout,
             cancel.clone(),
         );
+        if started {
+            let mut inner = entry.inner.lock().unwrap();
+            if inner.session_epoch == session_epoch
+                && matches!(inner.lifecycle, MotorLifecycle::Unknown)
+                && inner.auto_identify_state == AutoIdentifyState::Ready
+            {
+                inner.auto_identify_state = AutoIdentifyState::Attempted;
+            }
+        }
     }
 }
 
+fn invalidate_for_new_device_session(inner: &mut MotorEntryInner) {
+    inner.session_epoch = inner.session_epoch.wrapping_add(1);
+    inner.auto_identify_state = AutoIdentifyState::Ready;
+    inner.identity = None;
+    inner.can_config = crate::types::DeviceCanConfigStatus::Pending;
+    inner.lifecycle = MotorLifecycle::Unknown;
+    inner.last_tpdo = None;
+    inner.logic = None;
+    inner.target_mode = None;
+    inner.peak_torque_nm = None;
+    inner.mit_kp_kd_factor = None;
+    inner.measurements = Default::default();
+    inner.vel_filter = Default::default();
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_identify_if_idle(
     nid: u8,
     entry: Arc<MotorEntry>,
+    session_epoch: u64,
     inflight: Arc<StdMutex<HashSet<u8>>>,
     events_tx: broadcast::Sender<Cia402Event>,
     bus: Arc<dyn CanBus>,
     sdo_timeout: Duration,
     cancel: CancellationToken,
-) {
+) -> bool {
     {
         let mut g = inflight.lock().unwrap();
         if !g.insert(nid) {
             // 已经有 identify / initialize 等独占操作在跑
-            return;
+            return false;
         }
     }
     let inflight_guard = OwnedInflightGuard { set: inflight, nid };
@@ -195,31 +239,45 @@ fn spawn_identify_if_idle(
             _ = cancel.cancelled() => None,
             r = async {
                 let identity = identify_once(bus.as_ref(), nid, sdo_timeout).await?;
-                begin_device_can_config_read(&entry, &identity);
+                if !begin_device_can_config_read(&entry, session_epoch, &identity) {
+                    return Ok::<Option<MotorIdentity>, crate::error::Error>(None);
+                }
                 let can_config =
                     read_device_can_config(bus.as_ref(), &identity, sdo_timeout).await;
                 if let crate::types::DeviceCanConfigStatus::ReadFailed { reason } = &can_config {
                     log::warn!("read CAN config for nid 0x{nid:02X} failed: {reason}");
                 }
-                finish_device_can_config_read(&entry, can_config);
-                Ok::<MotorIdentity, crate::error::Error>(identity)
+                if !finish_device_can_config_read(&entry, session_epoch, can_config) {
+                    return Ok(None);
+                }
+                Ok(Some(identity))
             } => Some(r),
         };
 
         match res {
-            Some(Ok(identity)) => {
-                let _ = events_tx.send(Cia402Event::Identified { nid, identity });
+            Some(Ok(Some(identity))) => {
+                let inner = entry.inner.lock().unwrap();
+                if inner.session_epoch == session_epoch {
+                    let _ = events_tx.send(Cia402Event::Identified { nid, identity });
+                }
             }
+            Some(Ok(None)) => log::debug!(
+                "discarded stale identify result for nid 0x{nid:02X}, epoch {session_epoch}"
+            ),
             Some(Err(e)) => {
-                log::warn!("identify nid 0x{nid:02X} failed: {e}");
-                let _ = events_tx.send(Cia402Event::IdentifyFailed {
-                    nid,
-                    reason: e.to_string(),
-                });
+                let inner = entry.inner.lock().unwrap();
+                if inner.session_epoch == session_epoch {
+                    log::warn!("identify nid 0x{nid:02X} failed: {e}");
+                    let _ = events_tx.send(Cia402Event::IdentifyFailed {
+                        nid,
+                        reason: e.to_string(),
+                    });
+                }
             }
             None => log::debug!("identify nid 0x{nid:02X} cancelled"),
         }
     });
+    true
 }
 
 /// 后台 identify task 独占节点的 owned guard。任务取消、panic 或正常退出都会清理。
@@ -322,6 +380,13 @@ pub(crate) async fn run_liveness_monitor(
                         let was = inner.online;
                         inner.online = online_now;
                         let live = if was && !online_now {
+                            // Node-ID 可以在掉电期间被另一台设备复用。离线边沿必须
+                            // 丢弃旧身份/方言；下一次入向心跳会从 Unknown 自动重识别。
+                            // 同时清 NMT 状态，防止仅凭一帧 TPDO 就被误认为“本次会话
+                            // 已收到心跳”而允许设置写操作。
+                            invalidate_for_new_device_session(&mut inner);
+                            inner.nmt_revision = inner.nmt_revision.wrapping_add(1);
+                            inner.nmt_state = None;
                             Some(inner.build_live_state(now))
                         } else {
                             None
@@ -346,11 +411,378 @@ pub(crate) async fn run_liveness_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use can_transport::{CanCapabilities, CanFrame, CanId, CanIoError, CanRx};
     use tokio::sync::{mpsc, Notify};
+
+    #[tokio::test]
+    async fn failed_auto_identify_runs_only_once_per_session() {
+        let bus_impl = Arc::new(FailingIdentityBus::default());
+        let bus: Arc<dyn CanBus> = bus_impl.clone();
+        let motors = Arc::new(RwLock::new(HashMap::new()));
+        let inflight = Arc::new(StdMutex::new(HashSet::new()));
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+
+        handle_inbound_hb(
+            1,
+            nmt::NmtState::PreOperational,
+            &motors,
+            &inflight,
+            &events_tx,
+            &bus,
+            Duration::from_millis(20),
+            &cancel,
+        );
+        loop {
+            let event = events_rx.recv().await.unwrap();
+            if matches!(event, Cia402Event::IdentifyFailed { nid: 1, .. }) {
+                break;
+            }
+        }
+        assert_eq!(bus_impl.send_count.load(Ordering::Acquire), 1);
+
+        for _ in 0..4 {
+            handle_inbound_hb(
+                1,
+                nmt::NmtState::PreOperational,
+                &motors,
+                &inflight,
+                &events_tx,
+                &bus,
+                Duration::from_millis(20),
+                &cancel,
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(bus_impl.send_count.load(Ordering::Acquire), 1);
+        let entry = motors.read().unwrap()[&1].clone();
+        assert_eq!(
+            entry.inner.lock().unwrap().auto_identify_state,
+            AutoIdentifyState::Attempted
+        );
+
+        // Boot-Up creates a new epoch and therefore one new automatic attempt.
+        handle_inbound_hb(
+            1,
+            nmt::NmtState::BootUp,
+            &motors,
+            &inflight,
+            &events_tx,
+            &bus,
+            Duration::from_millis(20),
+            &cancel,
+        );
+        loop {
+            let event = events_rx.recv().await.unwrap();
+            if matches!(event, Cia402Event::IdentifyFailed { nid: 1, .. }) {
+                break;
+            }
+        }
+        assert_eq!(bus_impl.send_count.load(Ordering::Acquire), 2);
+        assert_eq!(entry.inner.lock().unwrap().session_epoch, 1);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn bootup_invalidates_cached_identity_and_retries_identify_after_inflight_clears() {
+        let state = Arc::new(BlockingConfigState::default());
+        let bus = Arc::new(BlockingConfigBus::new(state.clone()));
+        let entry = Arc::new(MotorEntry::new(1));
+        {
+            let mut inner = entry.inner.lock().unwrap();
+            inner.identity = Some(MotorIdentity {
+                node_id: 1,
+                vendor_id: 0x4859_444C,
+                product_code: 0xAAAA_0001,
+                revision_number: 0,
+                serial_number: 0,
+                product_name: None,
+            });
+            inner.can_config =
+                crate::types::DeviceCanConfigStatus::Available(crate::types::DeviceCanConfig {
+                    stored_node_id: 1,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(5_000_000),
+                    transmit_pdo_brs: Some(true),
+                });
+            inner.lifecycle = MotorLifecycle::Initialized;
+            inner.online = true;
+            inner.last_heartbeat = Some(Instant::now());
+            inner.last_tpdo = Some(Instant::now());
+            inner.nmt_state = Some(nmt::NmtState::Operational);
+            inner.measurements.position_rev = Some(0.25);
+        }
+        let motors = Arc::new(RwLock::new(HashMap::from([(1, entry.clone())])));
+        let inflight = Arc::new(StdMutex::new(HashSet::from([1])));
+        let (events_tx, _) = broadcast::channel(8);
+        let cancel = CancellationToken::new();
+        let bus_dyn: Arc<dyn CanBus> = bus;
+
+        handle_inbound_hb(
+            1,
+            nmt::NmtState::BootUp,
+            &motors,
+            &inflight,
+            &events_tx,
+            &bus_dyn,
+            Duration::from_millis(50),
+            &cancel,
+        );
+        {
+            let inner = entry.inner.lock().unwrap();
+            assert!(inner.identity.is_none());
+            assert_eq!(
+                inner.can_config,
+                crate::types::DeviceCanConfigStatus::Pending
+            );
+            assert_eq!(inner.lifecycle, MotorLifecycle::Unknown);
+            assert_eq!(inner.nmt_state, Some(nmt::NmtState::BootUp));
+            assert!(inner.last_heartbeat.is_some());
+            assert!(inner.last_tpdo.is_none());
+            assert_eq!(inner.measurements, Default::default());
+        }
+
+        // Boot-Up 时设置事务仍占着 inflight，因此没有启动 identify。下一帧心跳
+        // 在独占区释放后必须重新尝试，而不是继续信任旧缓存。
+        inflight.lock().unwrap().remove(&1);
+        handle_inbound_hb(
+            1,
+            nmt::NmtState::PreOperational,
+            &motors,
+            &inflight,
+            &events_tx,
+            &bus_dyn,
+            Duration::from_secs(5),
+            &cancel,
+        );
+        tokio::time::timeout(Duration::from_secs(1), state.wait_until_config_requested())
+            .await
+            .expect("the heartbeat after Boot-Up should retry identity and reach config read");
+        {
+            let inner = entry.inner.lock().unwrap();
+            assert_eq!(
+                inner
+                    .identity
+                    .as_ref()
+                    .map(|identity| (identity.vendor_id, identity.product_code)),
+                Some((0x4859_444C, 0xAAAA_0001))
+            );
+            assert_eq!(inner.lifecycle, MotorLifecycle::Identified);
+            assert_eq!(inner.session_epoch, 1);
+            assert_eq!(inner.auto_identify_state, AutoIdentifyState::Attempted);
+        }
+
+        // 旧 identify 正阻塞在配置读时又收到 Boot-Up：epoch 递增并清缓存。
+        handle_inbound_hb(
+            1,
+            nmt::NmtState::BootUp,
+            &motors,
+            &inflight,
+            &events_tx,
+            &bus_dyn,
+            Duration::from_secs(5),
+            &cancel,
+        );
+        {
+            let inner = entry.inner.lock().unwrap();
+            assert_eq!(inner.session_epoch, 2);
+            assert!(inner.identity.is_none());
+            assert_eq!(
+                inner.can_config,
+                crate::types::DeviceCanConfigStatus::Pending
+            );
+            assert_eq!(inner.auto_identify_state, AutoIdentifyState::Ready);
+        }
+
+        // 让真实旧 task 完成；epoch guard 必须丢弃它的结果。
+        state.release_config();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while inflight.lock().unwrap().contains(&1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released stale identify should finish");
+        {
+            let inner = entry.inner.lock().unwrap();
+            assert!(inner.identity.is_none());
+            assert_eq!(
+                inner.can_config,
+                crate::types::DeviceCanConfigStatus::Pending
+            );
+            assert_eq!(inner.lifecycle, MotorLifecycle::Unknown);
+        }
+
+        // 下一帧心跳启动新 epoch 唯一一次真实 SDO identify。
+        handle_inbound_hb(
+            1,
+            nmt::NmtState::PreOperational,
+            &motors,
+            &inflight,
+            &events_tx,
+            &bus_dyn,
+            Duration::from_secs(5),
+            &cancel,
+        );
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let ready = {
+                    let inner = entry.inner.lock().unwrap();
+                    inner.session_epoch == 2
+                        && inner.identity.is_some()
+                        && matches!(
+                            inner.can_config,
+                            crate::types::DeviceCanConfigStatus::Available(_)
+                        )
+                };
+                if ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new epoch heartbeat should identify successfully");
+        assert_eq!(
+            entry.inner.lock().unwrap().auto_identify_state,
+            AutoIdentifyState::Attempted
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn offline_edge_clears_identity_config_and_nmt_for_next_session() {
+        let entry = Arc::new(MotorEntry::new(1));
+        {
+            let mut inner = entry.inner.lock().unwrap();
+            inner.identity = Some(MotorIdentity {
+                node_id: 1,
+                vendor_id: 0x4859_444C,
+                product_code: 0xAAAA_0001,
+                revision_number: 0,
+                serial_number: 0,
+                product_name: None,
+            });
+            inner.can_config =
+                crate::types::DeviceCanConfigStatus::Available(crate::types::DeviceCanConfig {
+                    stored_node_id: 1,
+                    nominal_bitrate: 1_000_000,
+                    data_bitrate: Some(5_000_000),
+                    transmit_pdo_brs: Some(false),
+                });
+            inner.lifecycle = MotorLifecycle::Identified;
+            inner.online = true;
+            inner.last_heartbeat = Some(Instant::now() - Duration::from_secs(1));
+            inner.nmt_state = Some(nmt::NmtState::PreOperational);
+        }
+        let motors = Arc::new(RwLock::new(HashMap::from([(1, entry.clone())])));
+        let (events_tx, mut events_rx) = broadcast::channel(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_liveness_monitor(
+            motors,
+            events_tx,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            cancel.clone(),
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(200), events_rx.recv())
+            .await
+            .expect("liveness monitor should detect the stale node")
+            .expect("event channel should stay open");
+        assert!(matches!(event, Cia402Event::NodeOffline { nid: 1 }));
+        {
+            let inner = entry.inner.lock().unwrap();
+            assert!(!inner.online);
+            assert!(inner.identity.is_none());
+            assert_eq!(
+                inner.can_config,
+                crate::types::DeviceCanConfigStatus::Pending
+            );
+            assert_eq!(inner.lifecycle, MotorLifecycle::Unknown);
+            assert_eq!(inner.nmt_state, None);
+        }
+
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_identify_completion_after_offline_cannot_restore_stale_cache() {
+        let state = Arc::new(BlockingConfigState::default());
+        let bus: Arc<dyn CanBus> = Arc::new(BlockingConfigBus::new(state.clone()));
+        let entry = Arc::new(MotorEntry::new(1));
+        {
+            let mut inner = entry.inner.lock().unwrap();
+            inner.online = true;
+            inner.last_heartbeat = Some(Instant::now() - Duration::from_secs(1));
+            inner.nmt_state = Some(nmt::NmtState::PreOperational);
+        }
+        let motors = Arc::new(RwLock::new(HashMap::from([(1, entry.clone())])));
+        let inflight = Arc::new(StdMutex::new(HashSet::new()));
+        let (events_tx, mut events_rx) = broadcast::channel(8);
+        let identify_cancel = CancellationToken::new();
+        assert!(spawn_identify_if_idle(
+            1,
+            entry.clone(),
+            0,
+            inflight.clone(),
+            events_tx.clone(),
+            bus,
+            Duration::from_secs(5),
+            identify_cancel.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), state.wait_until_config_requested())
+            .await
+            .expect("old identify should block in its configuration read");
+
+        let liveness_cancel = CancellationToken::new();
+        let liveness_task = tokio::spawn(run_liveness_monitor(
+            motors,
+            events_tx,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            liveness_cancel.clone(),
+        ));
+        loop {
+            let event = tokio::time::timeout(Duration::from_millis(200), events_rx.recv())
+                .await
+                .expect("offline edge should be emitted")
+                .expect("event channel should stay open");
+            if matches!(event, Cia402Event::NodeOffline { nid: 1 }) {
+                break;
+            }
+        }
+        assert_eq!(entry.inner.lock().unwrap().session_epoch, 1);
+
+        state.release_config();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while inflight.lock().unwrap().contains(&1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stale identify should finish after release");
+        {
+            let inner = entry.inner.lock().unwrap();
+            assert!(!inner.online);
+            assert_eq!(inner.session_epoch, 1);
+            assert!(inner.identity.is_none());
+            assert_eq!(
+                inner.can_config,
+                crate::types::DeviceCanConfigStatus::Pending
+            );
+            assert_eq!(inner.lifecycle, MotorLifecycle::Unknown);
+        }
+
+        identify_cancel.cancel();
+        liveness_cancel.cancel();
+        liveness_task.await.unwrap();
+    }
 
     #[tokio::test]
     async fn cancelling_during_config_read_releases_bus_and_inflight_immediately() {
@@ -366,6 +798,7 @@ mod tests {
         spawn_identify_if_idle(
             1,
             entry.clone(),
+            0,
             inflight.clone(),
             events_tx,
             bus,
@@ -396,15 +829,47 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct FailingIdentityBus {
+        send_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CanBus for FailingIdentityBus {
+        async fn send(&self, _frame: CanFrame) -> std::result::Result<(), CanIoError> {
+            self.send_count.fetch_add(1, Ordering::AcqRel);
+            Err(CanIoError::backend(std::io::Error::other(
+                "simulated identity transport failure",
+            )))
+        }
+
+        async fn subscribe(
+            &self,
+            _filter: CanFilter,
+        ) -> std::result::Result<Box<dyn CanRx>, CanIoError> {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            Ok(Box::new(BlockingConfigRx { rx }))
+        }
+
+        fn capabilities(&self) -> CanCapabilities {
+            CanCapabilities {
+                fd: true,
+                max_dlen: 64,
+            }
+        }
+    }
+
+    #[derive(Default)]
     struct BlockingConfigState {
         config_requested: AtomicBool,
-        notify: Notify,
+        config_released: AtomicBool,
+        request_notify: Notify,
+        release_notify: Notify,
     }
 
     impl BlockingConfigState {
         fn mark_config_requested(&self) {
             self.config_requested.store(true, Ordering::Release);
-            self.notify.notify_waiters();
+            self.request_notify.notify_waiters();
         }
 
         async fn wait_until_config_requested(&self) {
@@ -412,7 +877,21 @@ mod tests {
                 if self.config_requested.load(Ordering::Acquire) {
                     return;
                 }
-                self.notify.notified().await;
+                self.request_notify.notified().await;
+            }
+        }
+
+        fn release_config(&self) {
+            self.config_released.store(true, Ordering::Release);
+            self.release_notify.notify_waiters();
+        }
+
+        async fn wait_until_config_released(&self) {
+            loop {
+                if self.config_released.load(Ordering::Acquire) {
+                    return;
+                }
+                self.release_notify.notified().await;
             }
         }
     }
@@ -455,8 +934,7 @@ mod tests {
 
             if index == 0x2001 {
                 self.state.mark_config_requested();
-                // Deliberately leave this SDO unanswered. Cancellation must drop the read future.
-                return Ok(());
+                self.state.wait_until_config_released().await;
             }
 
             let value = match (index, subindex) {
@@ -464,6 +942,11 @@ mod tests {
                 (0x1018, 2) => 0xAAAA_0001u32.to_le_bytes().to_vec(),
                 (0x1018, 3 | 4) => 0u32.to_le_bytes().to_vec(),
                 (0x1008, 0) => b"X".to_vec(),
+                (0x2001, 0) => vec![4],
+                (0x2001, 1) => vec![1],
+                (0x2001, 2) => 1_000_000u32.to_le_bytes().to_vec(),
+                (0x2001, 3) => 5_000_000u32.to_le_bytes().to_vec(),
+                (0x2001, 4) => vec![1],
                 _ => {
                     return Err(CanIoError::backend(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,

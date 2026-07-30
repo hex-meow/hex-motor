@@ -317,8 +317,8 @@ async fn read_runtime_constants(
 ) {
     let nid = entry.node_id;
 
-    // 0x6076 Motor Peak Torque：REAL32，单位 **Nm**（huayi.md 明确：6076h
-    // 峰值力矩，单位为Nm）。直接缓存，不做单位换算。
+    // 0x6076 Motor Peak Torque：设备对象字典规定为 REAL32，单位 **Nm**。
+    // 直接缓存，不做单位换算。
     match sdo::upload_f32(bus, nid, 0x6076, 0, sdo_timeout).await {
         Ok(nm) => {
             log::info!("nid 0x{nid:02X}: 0x6076 (Motor Peak Torque) = {nm} Nm");
