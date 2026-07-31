@@ -22,9 +22,7 @@ use can_transport::{CanBus, CanFilter, CanFrame, CanId, CanIoError};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use super::codec::{
-    decode_tpdo1, decode_tpdo2, status_word_to_logic, Tpdo1Frame, Tpdo2Frame,
-};
+use super::codec::{decode_tpdo1, decode_tpdo2, status_word_to_logic, Tpdo1Frame, Tpdo2Frame};
 use super::events::Cia402Event;
 use super::motor_entry::{MotorEntry, MotorEntryInner};
 use super::types::Logic;
@@ -146,12 +144,10 @@ fn handle_frame(
             TpdoKind::Tpdo2 => {
                 if let Some(f) = decode_tpdo2(frame.data()) {
                     apply_tpdo2(&mut inner.measurements, f);
+                    inner.tpdo2_revision = inner.tpdo2_revision.wrapping_add(1);
                     // 重新计算 logic + 边沿事件
-                    let new_logic = status_word_to_logic(
-                        f.status_word,
-                        inner.target_mode,
-                        f.error_code,
-                    );
+                    let new_logic =
+                        status_word_to_logic(f.status_word, inner.target_mode, f.error_code);
                     let was_error = matches!(inner.logic, Some(Logic::Error { .. }));
                     let is_error = matches!(new_logic, Logic::Error { .. });
                     inner.logic = Some(new_logic.clone());

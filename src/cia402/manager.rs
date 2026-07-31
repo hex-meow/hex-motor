@@ -19,13 +19,13 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::canopen::nmt::NmtState;
+use crate::canopen::nmt::{self, NmtCommand, NmtState};
 use crate::canopen::sdo;
 use crate::canopen::tpdo_config::SdoWrite;
 use crate::error::{Error, Result};
 use crate::types::{
     DeviceCanConfig, DeviceCanConfigStatus, DeviceSettingsResult, DeviceSettingsUpdate, MotorMode,
-    MotorTarget,
+    MotorIdentity, MotorTarget,
 };
 
 use super::device_can::{
@@ -36,7 +36,7 @@ use super::device_can::{
 use super::discovery::{identify_once, run_discovery, run_liveness_monitor};
 use super::events::{Cia402Event, EventStream, DEFAULT_EVENTS_CAPACITY};
 use super::heartbeat::run_hb_broadcast;
-use super::initialize::run_initialize;
+use super::initialize::{run_initialize, InitializeOutcome};
 use super::motor_entry::MotorEntry;
 use super::sequences::{
     build_clear_error_writes, build_disable_writes, build_set_mode_writes,
@@ -265,36 +265,8 @@ impl Cia402Manager {
 
         let entry = self.get_or_insert_entry(nid);
         let session_epoch = entry.inner.lock().unwrap().session_epoch;
-        let identity = identify_once(self.bus.as_ref(), nid, self.opts.sdo_timeout).await?;
-
-        if !begin_device_can_config_read(&entry, session_epoch, &identity) {
-            return Err(device_operation_rejected(
-                nid,
-                "device session changed during identity read",
-            ));
-        }
-        let can_config =
-            read_device_can_config(self.bus.as_ref(), &identity, self.opts.sdo_timeout).await;
-        if let crate::types::DeviceCanConfigStatus::ReadFailed { reason } = &can_config {
-            log::warn!("read CAN config for nid 0x{nid:02X} failed: {reason}");
-        }
-        if !finish_device_can_config_read(&entry, session_epoch, can_config) {
-            return Err(device_operation_rejected(
-                nid,
-                "device session changed during configuration read",
-            ));
-        }
-        let inner = entry.inner.lock().unwrap();
-        if inner.session_epoch != session_epoch {
-            return Err(device_operation_rejected(
-                nid,
-                "device session changed before identity result was published",
-            ));
-        }
-        let _ = self
-            .events_tx
-            .send(Cia402Event::Identified { nid, identity });
-        drop(inner);
+        self.identify_and_cache_in_session(&entry, session_epoch, None)
+            .await?;
         Ok(())
     }
 
@@ -314,8 +286,11 @@ impl Cia402Manager {
                 crate::error::Error::Internal(format!("nid 0x{nid:02X} not in list yet"))
             })?
         };
-        // 必须已 Identified（或 NeedsReinit）。Unknown 还没拉到 identity 不能配。
-        {
+        let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "initialize")?;
+
+        // 必须已 Identified（或 NeedsReinit）。检查与 identity 快照都放在独占区内，
+        // 避免 identify/其它 initialize 在 precheck 与首个 SDO 之间插入。
+        let (initial_session_epoch, expected_identity) = {
             let inner = entry.inner.lock().unwrap();
             if matches!(inner.lifecycle, MotorLifecycle::Unknown) {
                 return Err(crate::error::Error::NotReady {
@@ -323,10 +298,92 @@ impl Cia402Manager {
                     lifecycle: format!("{:?}", inner.lifecycle),
                 });
             }
-        }
+            let identity = inner.identity.clone().ok_or_else(|| Error::NotReady {
+                nid,
+                lifecycle: format!("{:?} without identity", inner.lifecycle),
+            })?;
+            (inner.session_epoch, identity)
+        };
 
-        let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "initialize")?;
-        run_initialize(self.bus.as_ref(), entry, &self.events_tx, &self.opts).await
+        match run_initialize(
+            self.bus.as_ref(),
+            entry.clone(),
+            &self.events_tx,
+            &self.opts,
+        )
+        .await?
+        {
+            InitializeOutcome::Initialized => Ok(()),
+            InitializeOutcome::NeedsCommunicationReset {
+                status_word,
+                error_code,
+                attempts,
+            } => {
+                // run_initialize 的 rollback 已把 lifecycle 从 Initializing 退回。
+                // 再次在同一把锁内确认旧 session/identity，才允许发破坏通信配置的
+                // targeted Reset Communication。
+                let bootup_revision = {
+                    let inner = entry.inner.lock().unwrap();
+                    let identity_matches = inner
+                        .identity
+                        .as_ref()
+                        .is_some_and(|actual| same_physical_device(&expected_identity, actual));
+                    if inner.session_epoch != initial_session_epoch || !identity_matches {
+                        return Err(device_operation_rejected(
+                            nid,
+                            "device session or identity changed before heartbeat recovery",
+                        ));
+                    }
+                    inner.bootup_revision
+                };
+
+                log::warn!(
+                    "nid 0x{nid:02X}: sticky heartbeat fault confirmed after {attempts} attempts \
+                     (sw=0x{status_word:04X}, error=0x{error_code:04X}); trying one targeted \
+                     Reset Communication"
+                );
+                let reset = nmt::build_nmt_command(NmtCommand::ResetCommunication, nid)?;
+                self.bus.send(reset).await?;
+
+                let reset_timeout =
+                    (self.opts.motor_heartbeat_period * 4).max(Duration::from_secs(2));
+                let new_session_epoch = wait_for_reset_communication_bootup(
+                    &entry,
+                    initial_session_epoch,
+                    bootup_revision,
+                    reset_timeout,
+                )
+                .await?;
+
+                self.identify_and_cache_in_session(
+                    &entry,
+                    new_session_epoch,
+                    Some(&expected_identity),
+                )
+                .await?;
+
+                match run_initialize(self.bus.as_ref(), entry, &self.events_tx, &self.opts).await? {
+                    InitializeOutcome::Initialized => {
+                        log::info!(
+                            "nid 0x{nid:02X}: initialize recovered after one Reset Communication"
+                        );
+                        Ok(())
+                    }
+                    InitializeOutcome::NeedsCommunicationReset {
+                        status_word,
+                        error_code,
+                        attempts,
+                    } => Err(device_operation_rejected(
+                        nid,
+                        format!(
+                            "sticky heartbeat fault remained after one Reset Communication \
+                             (sw=0x{status_word:04X}, error=0x{error_code:04X}, \
+                             attempts={attempts}); refusing another reset"
+                        ),
+                    )),
+                }
+            }
+        }
     }
 
     /// 对所有 `Identified` / `NeedsReinit` 节点**并发**跑 `initialize`。
@@ -824,6 +881,77 @@ impl Cia402Manager {
             .clone()
     }
 
+    /// 已持有该 nid 的 inflight guard 时，在指定 session 内完整读取并缓存身份及
+    /// CAN 配置。恢复路径可额外要求与 Reset Communication 前是同一颗设备。
+    async fn identify_and_cache_in_session(
+        &self,
+        entry: &Arc<MotorEntry>,
+        expected_epoch: u64,
+        expected_device: Option<&MotorIdentity>,
+    ) -> Result<MotorIdentity> {
+        let nid = entry.node_id;
+        if entry.inner.lock().unwrap().session_epoch != expected_epoch {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed before identity read",
+            ));
+        }
+
+        let identity = identify_once(self.bus.as_ref(), nid, self.opts.sdo_timeout).await?;
+        if entry.inner.lock().unwrap().session_epoch != expected_epoch {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed during identity read",
+            ));
+        }
+
+        if let Some(expected) = expected_device {
+            if !same_physical_device(expected, &identity) {
+                return Err(device_operation_rejected(
+                    nid,
+                    format!(
+                        "identity changed across Reset Communication: expected {}, observed {}",
+                        stable_identity_summary(expected),
+                        stable_identity_summary(&identity),
+                    ),
+                ));
+            }
+        }
+
+        // 身份不匹配时必须在这里之前退出，不能按旧设备方言去探测替换设备。
+        if !begin_device_can_config_read(entry, expected_epoch, &identity) {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed before configuration read",
+            ));
+        }
+        let can_config =
+            read_device_can_config(self.bus.as_ref(), &identity, self.opts.sdo_timeout).await;
+        if let DeviceCanConfigStatus::ReadFailed { reason } = &can_config {
+            log::warn!("read CAN config for nid 0x{nid:02X} failed: {reason}");
+        }
+        if !finish_device_can_config_read(entry, expected_epoch, can_config) {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed during configuration read",
+            ));
+        }
+
+        let inner = entry.inner.lock().unwrap();
+        if inner.session_epoch != expected_epoch {
+            return Err(device_operation_rejected(
+                nid,
+                "device session changed before identity result was published",
+            ));
+        }
+        let _ = self.events_tx.send(Cia402Event::Identified {
+            nid,
+            identity: identity.clone(),
+        });
+        drop(inner);
+        Ok(identity)
+    }
+
     fn validate_settings_target(
         &self,
         nid: u8,
@@ -1275,6 +1403,68 @@ fn update_with_new_node_id(
     }
 }
 
+fn same_physical_device(expected: &MotorIdentity, observed: &MotorIdentity) -> bool {
+    expected.node_id == observed.node_id
+        && expected.vendor_id == observed.vendor_id
+        && expected.product_code == observed.product_code
+        && expected.revision_number == observed.revision_number
+        && expected.serial_number == observed.serial_number
+}
+
+fn stable_identity_summary(identity: &MotorIdentity) -> String {
+    format!(
+        "nid=0x{:02X}, vendor=0x{:08X}, product=0x{:08X}, revision=0x{:08X}, serial=0x{:08X}",
+        identity.node_id,
+        identity.vendor_id,
+        identity.product_code,
+        identity.revision_number,
+        identity.serial_number,
+    )
+}
+
+/// Reset Communication 的完成 fence：必须看见一帧新的 Boot-Up（不能仅靠
+/// offline 也会推进的 session_epoch），并等该新 session 进入 Pre-Operational。
+async fn wait_for_reset_communication_bootup(
+    entry: &Arc<MotorEntry>,
+    previous_session_epoch: u64,
+    previous_bootup_revision: u64,
+    timeout: Duration,
+) -> Result<u64> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ready = {
+            let inner = entry.inner.lock().unwrap();
+            (inner.bootup_revision != previous_bootup_revision
+                && inner.session_epoch != previous_session_epoch
+                && inner.online
+                && inner.nmt_state == Some(NmtState::PreOperational))
+            .then_some(inner.session_epoch)
+        };
+        if let Some(session_epoch) = ready {
+            return Ok(session_epoch);
+        }
+        if Instant::now() >= deadline {
+            let inner = entry.inner.lock().unwrap();
+            log::warn!(
+                "nid 0x{:02X}: timed out waiting for Reset Communication Boot-Up \
+                 (session {} -> {}, bootup revision {} -> {}, NMT={:?}, online={})",
+                entry.node_id,
+                previous_session_epoch,
+                inner.session_epoch,
+                previous_bootup_revision,
+                inner.bootup_revision,
+                inner.nmt_state,
+                inner.online,
+            );
+            return Err(Error::DeviceOperationTimeout {
+                nid: entry.node_id,
+                operation: "waiting for Reset Communication Boot-Up/Pre-Operational",
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn device_operation_rejected(nid: u8, reason: impl Into<String>) -> Error {
     Error::DeviceOperationRejected {
         nid,
@@ -1356,6 +1546,85 @@ mod tests {
     type SdoKey = (u8, u16, u8);
     type ScriptedValue = (SdoKey, Vec<Vec<u8>>);
     type SendHook = Arc<dyn Fn(u8, &RecordedSdo) + Send + Sync>;
+
+    fn recovery_identity(product_name: Option<&str>) -> MotorIdentity {
+        MotorIdentity {
+            node_id: 1,
+            vendor_id: MOTOR_VENDOR,
+            product_code: MOTOR_PRODUCT,
+            revision_number: 3,
+            serial_number: 4,
+            product_name: product_name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn reset_recovery_identity_uses_only_mandatory_1018_fields() {
+        let expected = recovery_identity(Some("cached name"));
+        let observed_without_optional_name = recovery_identity(None);
+        assert!(same_physical_device(
+            &expected,
+            &observed_without_optional_name
+        ));
+
+        let mut changed = observed_without_optional_name.clone();
+        changed.serial_number += 1;
+        assert!(!same_physical_device(&expected, &changed));
+        changed = observed_without_optional_name.clone();
+        changed.revision_number += 1;
+        assert!(!same_physical_device(&expected, &changed));
+        changed = observed_without_optional_name.clone();
+        changed.product_code += 1;
+        assert!(!same_physical_device(&expected, &changed));
+        changed = observed_without_optional_name.clone();
+        changed.vendor_id += 1;
+        assert!(!same_physical_device(&expected, &changed));
+        changed = observed_without_optional_name;
+        changed.node_id += 1;
+        assert!(!same_physical_device(&expected, &changed));
+    }
+
+    #[tokio::test]
+    async fn reset_wait_requires_a_new_bootup_not_only_a_new_session_epoch() {
+        let entry = Arc::new(MotorEntry::new(1));
+        {
+            let mut inner = entry.inner.lock().unwrap();
+            // 模拟 offline invalidation 后又收到普通 Pre-Operational：epoch 已变，
+            // 但没有 Boot-Up，不能证明 Reset Communication 被执行。
+            inner.session_epoch = 4;
+            inner.bootup_revision = 2;
+            inner.online = true;
+            inner.nmt_state = Some(NmtState::PreOperational);
+        }
+        let error = wait_for_reset_communication_bootup(
+            &entry,
+            3,
+            2,
+            Duration::from_millis(15),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::DeviceOperationTimeout { .. }));
+
+        // Boot-Up 即使已经快速过渡为 Pre-Operational，revision 仍会保留证据。
+        {
+            let mut inner = entry.inner.lock().unwrap();
+            inner.session_epoch = 5;
+            inner.bootup_revision = 3;
+            inner.nmt_state = Some(NmtState::PreOperational);
+        }
+        assert_eq!(
+            wait_for_reset_communication_bootup(
+                &entry,
+                4,
+                2,
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap(),
+            5
+        );
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RecordedSdo {

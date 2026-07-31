@@ -46,6 +46,9 @@ pub(crate) struct MotorEntryInner {
     pub session_epoch: u64,
     /// 入向心跳的 NMT 状态发生变化时递增，用于设置事务的 TOCTOU 检查。
     pub nmt_revision: u64,
+    /// 每次 discovery 确认收到 Boot-Up 帧时递增。与 `session_epoch` 分开，
+    /// 因为离线失效也会推进 session epoch，不能拿它证明通信复位已被设备执行。
+    pub bootup_revision: u64,
     pub auto_identify_state: AutoIdentifyState,
     pub identity: Option<MotorIdentity>,
     /// 设备对象字典报告的 CAN 配置。身份读取完成后按精确产品方言读取一次。
@@ -55,6 +58,9 @@ pub(crate) struct MotorEntryInner {
     pub online: bool,
     pub last_heartbeat: Option<Instant>,
     pub last_tpdo: Option<Instant>,
+    /// 每次成功解码 TPDO2 后递增。初始化清错用它建立 freshness fence；
+    /// 不能复用 `last_tpdo`，因为 1 kHz TPDO1 也会刷新后者。
+    pub tpdo2_revision: u64,
     pub nmt_state: Option<NmtState>,
     /// 控制逻辑。由 [`crate::cia402::tpdo_listener`] 在 TPDO2 到达时
     /// 根据 status_word + `target_mode` 解算并写入。
@@ -90,6 +96,7 @@ impl MotorEntry {
             inner: Mutex::new(MotorEntryInner {
                 session_epoch: 0,
                 nmt_revision: 0,
+                bootup_revision: 0,
                 auto_identify_state: AutoIdentifyState::Ready,
                 identity: None,
                 can_config: DeviceCanConfigStatus::Pending,
@@ -97,6 +104,7 @@ impl MotorEntry {
                 online: false,
                 last_heartbeat: None,
                 last_tpdo: None,
+                tpdo2_revision: 0,
                 nmt_state: None,
                 logic: None,
                 target_mode: None,
@@ -171,12 +179,14 @@ mod tests {
         assert_eq!(g.lifecycle, MotorLifecycle::Unknown);
         assert_eq!(g.session_epoch, 0);
         assert_eq!(g.nmt_revision, 0);
+        assert_eq!(g.bootup_revision, 0);
         assert_eq!(g.auto_identify_state, AutoIdentifyState::Ready);
         assert!(!g.online);
         assert!(g.identity.is_none());
         assert_eq!(g.can_config, DeviceCanConfigStatus::Pending);
         assert!(g.last_heartbeat.is_none());
         assert!(g.last_tpdo.is_none());
+        assert_eq!(g.tpdo2_revision, 0);
     }
 
     #[test]

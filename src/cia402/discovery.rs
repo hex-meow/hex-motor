@@ -129,6 +129,7 @@ fn handle_inbound_hb(
         // 快速重启可能短于 offline 阈值。Boot-Up 本身就是新会话的强信号，
         // 必须立即丢弃旧身份/配置，不能等 liveness monitor 判离线。
         if state == nmt::NmtState::BootUp {
+            inner.bootup_revision = inner.bootup_revision.wrapping_add(1);
             invalidate_for_new_device_session(&mut inner);
         }
 
@@ -540,6 +541,7 @@ mod tests {
             );
             assert_eq!(inner.lifecycle, MotorLifecycle::Unknown);
             assert_eq!(inner.nmt_state, Some(nmt::NmtState::BootUp));
+            assert_eq!(inner.bootup_revision, 1);
             assert!(inner.last_heartbeat.is_some());
             assert!(inner.last_tpdo.is_none());
             assert_eq!(inner.measurements, Default::default());
@@ -589,6 +591,7 @@ mod tests {
         {
             let inner = entry.inner.lock().unwrap();
             assert_eq!(inner.session_epoch, 2);
+            assert_eq!(inner.bootup_revision, 2);
             assert!(inner.identity.is_none());
             assert_eq!(
                 inner.can_config,
@@ -705,6 +708,7 @@ mod tests {
             );
             assert_eq!(inner.lifecycle, MotorLifecycle::Unknown);
             assert_eq!(inner.nmt_state, None);
+            assert_eq!(inner.bootup_revision, 0);
         }
 
         cancel.cancel();

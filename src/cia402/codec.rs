@@ -94,8 +94,8 @@ pub fn decode_tpdo2(data: &[u8]) -> Option<Tpdo2Frame> {
 //
 // 状态由低 4 位 + bit 5,6 联合判定。我们这里**只关心 3 件事**：
 //
-//   1. Fault 置位（bit 3） → Logic::Error
-//   2. Operation Enabled（bits 0..2 == 0b111） → Logic::Enabled
+//   1. Fault 置位（bit 3）或当前 0x603F 非零 → Logic::Error
+//   2. 严格 Operation Enabled（mask 0x006F/value 0x0027） → Logic::Enabled
 //   3. 其他全部塌缩为 Logic::Disabled
 //
 // 这样上层 UI 只需要"能/不能/坏了"，足够 v0.1 上位机使用。
@@ -105,9 +105,13 @@ pub fn status_word_has_fault(sw: u16) -> bool {
     (sw & 0x0008) != 0
 }
 
-/// CiA402 status_word 低 3 位都置 1 = Operation Enabled state。
+/// 严格判断 CiA402 Operation Enabled state。
+///
+/// 不能只检查低 3 位：Quick Stop Active (`0x0007`/`0x0017`) 也会保留
+/// bits 0..=2。CiA402 状态机掩码还必须包含 fault、quick-stop 与
+/// switch-on-disabled 位。
 pub fn status_word_is_operation_enabled(sw: u16) -> bool {
-    (sw & 0x0007) == 0x0007
+    (sw & 0x006F) == 0x0027
 }
 
 /// 把 status_word + 当前目标模式 + 错误码 综合判定为 [`Logic`]。
@@ -120,7 +124,10 @@ pub fn status_word_to_logic(
     current_target_mode: Option<MotorMode>,
     error_code: u16,
 ) -> Logic {
-    if status_word_has_fault(sw) {
+    // Some devices publish 0x603F one TPDO before 0x6041.bit3 re-latches.
+    // Treat the current error code as authoritative as well, otherwise that
+    // frame can transiently overwrite a real fault with Logic::Enabled.
+    if status_word_has_fault(sw) || error_code != 0 {
         return Logic::Error {
             kind: error_code_to_kind(error_code),
             raw_code: error_code,
@@ -226,7 +233,8 @@ mod tests {
     #[test]
     fn status_op_enabled_detection() {
         assert!(status_word_is_operation_enabled(0x0237));
-        assert!(status_word_is_operation_enabled(0x0007));
+        assert!(!status_word_is_operation_enabled(0x0007)); // Quick Stop Active
+        assert!(!status_word_is_operation_enabled(0x0017)); // Quick Stop Active + voltage
         assert!(!status_word_is_operation_enabled(0x0003)); // Switched On but not OE
         assert!(!status_word_is_operation_enabled(0x0040)); // Switch On Disabled
     }
@@ -240,6 +248,18 @@ mod tests {
             Logic::Error {
                 kind: MotorErrorKind::OverCurrent,
                 raw_code: 0x2310,
+            }
+        ));
+    }
+
+    #[test]
+    fn logic_from_nonzero_error_code_preempts_fault_bit_relatch() {
+        let l = status_word_to_logic(0x0237, Some(MotorMode::Mit), 0x8130);
+        assert!(matches!(
+            l,
+            Logic::Error {
+                kind: MotorErrorKind::HeartbeatLost,
+                raw_code: 0x8130,
             }
         ));
     }
