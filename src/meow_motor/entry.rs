@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify};
 
 use crate::canopen::nmt::NmtState;
 use crate::error::{Error, Result};
@@ -25,6 +25,8 @@ pub(crate) struct MotorEntry {
     snapshot: ArcSwap<MeowMotorLiveState>,
     status_tx: watch::Sender<MeowMotorLiveState>,
     status_stream_tx: broadcast::Sender<MeowMotorLiveState>,
+    /// Serializes SDO writes to 0x4401 and records when the previous one completed.
+    pub mode_command_sdo_last_completed: AsyncMutex<Option<Instant>>,
     pub notify: Notify,
 }
 
@@ -93,6 +95,7 @@ impl MotorEntry {
             snapshot: ArcSwap::from(Arc::new(initial)),
             status_tx,
             status_stream_tx,
+            mode_command_sdo_last_completed: AsyncMutex::new(None),
             notify: Notify::new(),
         }
     }

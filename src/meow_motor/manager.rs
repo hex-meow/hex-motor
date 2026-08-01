@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use can_transport::CanBus;
 use canopen_sdo::{asynch::AsyncSdoError, SdoAbortCode, SdoError};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +45,7 @@ use super::types::{
 use super::CompressedMitMapping;
 
 const SDO_WRITE_GAP: Duration = Duration::from_millis(2);
+const MODE_COMMAND_SDO_REWRITE_GAP: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
 pub struct MeowMotorManagerOptions {
@@ -149,6 +150,16 @@ struct IdentityToken {
 struct OperationalToken {
     identity: IdentityToken,
     nmt_revision: u64,
+}
+
+struct ModeCommandSdoCompletionGuard<'a> {
+    last_completed: MutexGuard<'a, Option<Instant>>,
+}
+
+impl Drop for ModeCommandSdoCompletionGuard<'_> {
+    fn drop(&mut self) {
+        *self.last_completed = Some(Instant::now());
+    }
 }
 
 impl MeowMotorManager {
@@ -345,6 +356,7 @@ impl MeowMotorManager {
         .await?;
         self.ensure_identity_token(entry, token)?;
 
+        self.clear_existing_error_sdo(entry, token).await?;
         self.write_one(node_id, &build_disable_sdo_write()).await?;
         self.wait_sdo_mode_disabled(entry, token).await?;
 
@@ -558,17 +570,10 @@ impl MeowMotorManager {
         let command_completed_at = Instant::now();
         if let Some(token) = operational {
             self.ensure_operational_token(&entry, &token)?;
-            self.wait_for_logic_after(
-                &entry,
-                &token,
-                baseline,
-                command_completed_at,
-                MeowMotorLogic::Disabled,
-                "clear error confirmation",
-            )
-            .await
+            self.wait_for_clear_after(&entry, &token, baseline, command_completed_at)
+                .await
         } else {
-            self.wait_sdo_mode_disabled(&entry, &identity).await
+            self.wait_sdo_clear_disabled(&entry, &identity).await
         }
     }
 
@@ -1086,6 +1091,64 @@ impl MeowMotorManager {
         }
     }
 
+    async fn wait_for_clear_after(
+        &self,
+        entry: &Arc<MotorEntry>,
+        token: &OperationalToken,
+        baseline: u64,
+        command_completed_at: Instant,
+    ) -> Result<()> {
+        let deadline = Instant::now() + self.options.mode_confirm_timeout;
+        let mut last_observed = None;
+        loop {
+            let notified = entry.notify.notified();
+            {
+                let inner = entry.inner.lock().unwrap();
+                self.ensure_operational_token_inner(entry.node_id, &inner, token)?;
+                if inner.measurements.tpdo2_generation != baseline
+                    && inner
+                        .last_tpdo2
+                        .is_some_and(|received| received >= command_completed_at)
+                {
+                    if clear_is_confirmed(inner.logic) {
+                        return Ok(());
+                    }
+                    last_observed = inner.logic;
+                }
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(clear_confirmation_timeout(entry.node_id, last_observed));
+            };
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return Err(clear_confirmation_timeout(entry.node_id, last_observed));
+            }
+        }
+    }
+
+    async fn clear_existing_error_sdo(
+        &self,
+        entry: &Arc<MotorEntry>,
+        token: &IdentityToken,
+    ) -> Result<()> {
+        self.ensure_identity_token(entry, token)?;
+        let display = sdo::upload_u8(
+            self.bus.as_ref(),
+            entry.node_id,
+            0x4402,
+            0,
+            Some(self.options.sdo_timeout),
+        )
+        .await?;
+        self.ensure_identity_token(entry, token)?;
+        if matches!(display, 0xA1..=0xA6 | 0xAF) {
+            self.write_one(entry.node_id, &build_clear_error_sdo_write())
+                .await?;
+            self.wait_sdo_clear_disabled(entry, token).await?;
+        }
+        Ok(())
+    }
+
     async fn wait_sdo_mode_disabled(
         &self,
         entry: &Arc<MotorEntry>,
@@ -1132,7 +1195,69 @@ impl MeowMotorManager {
         }
     }
 
+    async fn wait_sdo_clear_disabled(
+        &self,
+        entry: &Arc<MotorEntry>,
+        token: &IdentityToken,
+    ) -> Result<()> {
+        let deadline = Instant::now() + self.options.mode_confirm_timeout;
+        loop {
+            self.ensure_identity_token(entry, token)?;
+            let display = sdo::upload_u8(
+                self.bus.as_ref(),
+                entry.node_id,
+                0x4402,
+                0,
+                Some(self.options.sdo_timeout),
+            )
+            .await?;
+            self.ensure_identity_token(entry, token)?;
+            if display == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let detailed = if matches!(display, 0xA1..=0xA6 | 0xAF) {
+                    sdo::upload_u16(
+                        self.bus.as_ref(),
+                        entry.node_id,
+                        0x453F,
+                        0,
+                        Some(self.options.sdo_timeout),
+                    )
+                    .await
+                    .ok()
+                } else {
+                    None
+                };
+                return Err(clear_sdo_confirmation_timeout(
+                    entry.node_id,
+                    Some(display),
+                    detailed,
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     async fn write_one(&self, node_id: u8, write: &SdoWrite) -> Result<()> {
+        if write.index == 0x4401 && write.subindex == 0 {
+            let entry = self.entry(node_id)?;
+            let last_completed = entry.mode_command_sdo_last_completed.lock().await;
+            if let Some(delay) = mode_command_sdo_rewrite_delay(*last_completed, Instant::now()) {
+                tokio::time::sleep(delay).await;
+            }
+            let _completion_guard = ModeCommandSdoCompletionGuard { last_completed };
+            return sdo::download(
+                self.bus.as_ref(),
+                node_id,
+                write.index,
+                write.subindex,
+                &write.data,
+                Some(self.options.sdo_timeout),
+            )
+            .await;
+        }
+
         sdo::download(
             self.bus.as_ref(),
             node_id,
@@ -1383,6 +1508,57 @@ fn profile_limit_readback_matches(expected: f32, observed: f32) -> bool {
     expected.to_bits() == observed.to_bits()
 }
 
+fn mode_command_sdo_rewrite_delay(
+    last_completed: Option<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    last_completed
+        .and_then(|completed| {
+            MODE_COMMAND_SDO_REWRITE_GAP.checked_sub(now.saturating_duration_since(completed))
+        })
+        .filter(|delay| !delay.is_zero())
+}
+
+fn clear_confirmation_timeout(node_id: u8, observed: Option<MeowMotorLogic>) -> Error {
+    Error::DeviceOperationRejected {
+        nid: node_id,
+        reason: match observed {
+            Some(MeowMotorLogic::Error {
+                mode_display,
+                detailed_error,
+            }) => format!(
+                "clear error confirmation timed out waiting for Disabled; mode=0x{mode_display:02X}, detail=0x{detailed_error:04X}"
+            ),
+            other => format!(
+                "clear error confirmation timed out waiting for Disabled; last observed {other:?}"
+            ),
+        },
+    }
+}
+
+fn clear_is_confirmed(observed: Option<MeowMotorLogic>) -> bool {
+    observed == Some(MeowMotorLogic::Disabled)
+}
+
+fn clear_sdo_confirmation_timeout(
+    node_id: u8,
+    display: Option<u8>,
+    detailed: Option<u16>,
+) -> Error {
+    Error::DeviceOperationRejected {
+        nid: node_id,
+        reason: match (display, detailed) {
+            (Some(display), Some(detailed)) => format!(
+                "clear error confirmation timed out; mode=0x{display:02X}, detail=0x{detailed:04X}"
+            ),
+            (Some(display), None) => {
+                format!("clear error confirmation timed out; mode=0x{display:02X}")
+            }
+            (None, _) => "clear error confirmation timed out without a mode observation".into(),
+        },
+    }
+}
+
 fn telemetry_is_fresh(
     inner: &super::entry::MotorEntryInner,
     stale_threshold: Duration,
@@ -1506,6 +1682,32 @@ mod tests {
             expected,
             f32::from_bits(expected.to_bits() + 1)
         ));
+    }
+
+    #[test]
+    fn mode_command_sdo_rewrites_wait_five_ms_after_completion() {
+        let completed = Instant::now();
+        assert_eq!(
+            mode_command_sdo_rewrite_delay(Some(completed), completed + Duration::from_millis(4)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            mode_command_sdo_rewrite_delay(Some(completed), completed + Duration::from_millis(5)),
+            None
+        );
+        assert_eq!(mode_command_sdo_rewrite_delay(None, completed), None);
+    }
+
+    #[test]
+    fn clear_timeout_keeps_transitional_error_for_diagnostics() {
+        let transitional = Some(MeowMotorLogic::Error {
+            mode_display: 0xA4,
+            detailed_error: 0,
+        });
+        assert!(!clear_is_confirmed(transitional));
+        assert!(clear_is_confirmed(Some(MeowMotorLogic::Disabled)));
+        let error = clear_confirmation_timeout(1, transitional);
+        assert!(error.to_string().contains("A4"));
     }
 
     #[test]
