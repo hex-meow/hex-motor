@@ -240,6 +240,16 @@ impl MeowMotorManager {
         Ok(self.entry(node_id)?.subscribe())
     }
 
+    /// Full publication stream for recording. Unlike the watch subscription,
+    /// this preserves every queued TPDO-derived snapshot or reports lag through
+    /// `tokio::sync::broadcast::error::RecvError::Lagged`.
+    pub fn subscribe_status_stream(
+        &self,
+        node_id: u8,
+    ) -> Result<broadcast::Receiver<MeowMotorLiveState>> {
+        Ok(self.entry(node_id)?.subscribe_stream())
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<MeowMotorEvent> {
         self.events.subscribe()
     }

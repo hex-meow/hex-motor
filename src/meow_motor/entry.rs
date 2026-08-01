@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 
 use crate::canopen::nmt::NmtState;
 use crate::error::{Error, Result};
@@ -17,11 +17,14 @@ use super::types::{
     MeowMotorLogic, MeowMotorMeasurements,
 };
 
+const STATUS_STREAM_CAPACITY: usize = 8192;
+
 pub(crate) struct MotorEntry {
     pub node_id: u8,
     pub inner: Mutex<MotorEntryInner>,
     snapshot: ArcSwap<MeowMotorLiveState>,
     status_tx: watch::Sender<MeowMotorLiveState>,
+    status_stream_tx: broadcast::Sender<MeowMotorLiveState>,
     pub notify: Notify,
 }
 
@@ -62,6 +65,7 @@ impl MotorEntry {
         let now = Instant::now();
         let initial = MeowMotorLiveState::empty(now);
         let (status_tx, _) = watch::channel(initial.clone());
+        let (status_stream_tx, _) = broadcast::channel(STATUS_STREAM_CAPACITY);
         Self {
             node_id,
             inner: Mutex::new(MotorEntryInner {
@@ -88,6 +92,7 @@ impl MotorEntry {
             }),
             snapshot: ArcSwap::from(Arc::new(initial)),
             status_tx,
+            status_stream_tx,
             notify: Notify::new(),
         }
     }
@@ -100,9 +105,14 @@ impl MotorEntry {
         self.status_tx.subscribe()
     }
 
+    pub fn subscribe_stream(&self) -> broadcast::Receiver<MeowMotorLiveState> {
+        self.status_stream_tx.subscribe()
+    }
+
     pub fn publish(&self, state: MeowMotorLiveState) {
         self.snapshot.store(Arc::new(state.clone()));
-        self.status_tx.send_replace(state);
+        self.status_tx.send_replace(state.clone());
+        let _ = self.status_stream_tx.send(state);
         self.notify.notify_waiters();
     }
 }
@@ -297,6 +307,23 @@ mod tests {
         assert!(registry.try_acquire(2, "other node").is_ok());
         drop(first);
         assert!(registry.try_acquire(1, "retry").is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_status_stream_preserves_each_published_snapshot() {
+        let entry = MotorEntry::new(1);
+        let mut stream = entry.subscribe_stream();
+        for generation in 1..=3 {
+            let mut state = entry.status();
+            state.measurements.tpdo1_generation = generation;
+            entry.publish(state);
+        }
+        for generation in 1..=3 {
+            assert_eq!(
+                stream.recv().await.unwrap().measurements.tpdo1_generation,
+                generation
+            );
+        }
     }
 
     #[test]

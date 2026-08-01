@@ -47,6 +47,16 @@ pub const KNOWN_DEVICES: &[KnownDevice] = &[
         name: "CiA402 HEX-4360P",
     },
     KnownDevice {
+        vendor_id: 0x0068_6578,
+        product_code: 0x6C64_BC78,
+        name: "hexmeow 4310",
+    },
+    KnownDevice {
+        vendor_id: 0x0068_6578,
+        product_code: 0x6C64_BCAA,
+        name: "hexmeow 4342",
+    },
+    KnownDevice {
         vendor_id: 0x6865_786D,
         product_code: 0x0069_6D75,
         name: "HexMeow IMU (bench/demo)",
@@ -120,6 +130,11 @@ mod tests {
 
         let d = lookup_known_device(0x4859_444C, 0xAAAA_0005).unwrap();
         assert_eq!(d.name, "CiA402 HEX-4360P");
+
+        let d = lookup_known_device(0x0068_6578, 0x6C64_BC78).unwrap();
+        assert_eq!(d.name, "hexmeow 4310");
+        let d = lookup_known_device(0x0068_6578, 0x6C64_BCAA).unwrap();
+        assert_eq!(d.name, "hexmeow 4342");
     }
 
     #[test]

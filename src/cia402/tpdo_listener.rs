@@ -22,6 +22,8 @@ use can_transport::{CanBus, CanFilter, CanFrame, CanId, CanIoError};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::meow_motor::model_for_identity;
+
 use super::codec::{decode_tpdo1, decode_tpdo2, status_word_to_logic, Tpdo1Frame, Tpdo2Frame};
 use super::events::Cia402Event;
 use super::motor_entry::{MotorEntry, MotorEntryInner};
@@ -116,6 +118,22 @@ fn handle_frame(
         // 不主动建条目（避免假数据污染列表）。
         return;
     };
+
+    // The legacy manager remains the shared heartbeat/0x1018/0x2001 inventory
+    // owner, but Meow Motor TPDOs belong exclusively to its dedicated driver.
+    // Gate on the complete identity tuple so an unrelated short PDO can never
+    // be reclassified by payload length alone.
+    if entry
+        .inner
+        .lock()
+        .unwrap()
+        .identity
+        .as_ref()
+        .and_then(model_for_identity)
+        .is_some()
+    {
+        return;
+    }
 
     let now = Instant::now();
 
@@ -212,4 +230,40 @@ fn apply_tpdo2(m: &mut super::types::Measurements, f: Tpdo2Frame) {
     m.status_word = Some(f.status_word);
     m.driver_temp_c = Some(f.driver_temp_c());
     m.motor_temp_c = Some(f.motor_temp_c());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meow_motor::{PRODUCT_CODE_4310, VENDOR_ID};
+    use crate::types::MotorIdentity;
+
+    #[test]
+    fn exact_meow_identity_is_left_to_the_dedicated_tpdo_listener() {
+        let entry = Arc::new(MotorEntry::new(1));
+        entry.inner.lock().unwrap().identity = Some(MotorIdentity {
+            node_id: 1,
+            vendor_id: VENDOR_ID,
+            product_code: PRODUCT_CODE_4310,
+            revision_number: 1,
+            serial_number: 2,
+            product_name: None,
+        });
+        let motors = Arc::new(RwLock::new(HashMap::from([(1, entry.clone())])));
+        let (events, _) = broadcast::channel(4);
+        let frame = CanFrame::new_fd(0x181, &[0; 8], true).unwrap();
+
+        handle_frame(
+            Ok(frame),
+            TpdoKind::Tpdo1,
+            &motors,
+            &events,
+            Duration::from_millis(15),
+        );
+
+        let inner = entry.inner.lock().unwrap();
+        assert!(inner.last_tpdo.is_none());
+        assert!(!inner.online);
+        assert_eq!(inner.measurements, Default::default());
+    }
 }

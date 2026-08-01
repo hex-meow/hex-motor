@@ -27,6 +27,8 @@ const OBJECT_2001_IDENTITIES: &[(u32, u32)] = &[
     (0x4859_444C, 0xAAAA_0001),
     (0x4859_444C, 0xAAAA_0002),
     (0x4859_444C, 0xAAAA_0005),
+    (0x0068_6578, 0x6C64_BC78),
+    (0x0068_6578, 0x6C64_BCAA),
 ];
 
 const OBJECT_2100_IDENTITIES: &[(u32, u32)] = &[
@@ -425,8 +427,15 @@ mod tests {
                 Some(CanConfigDialect::Object2001)
             );
         }
+        for product_code in [0x6C64_BC78, 0x6C64_BCAA] {
+            assert_eq!(
+                dialect_for(&identity(0x0068_6578, product_code)),
+                Some(CanConfigDialect::Object2001)
+            );
+        }
         assert_eq!(dialect_for(&identity(0x4859_444C, 0xAAAA_9999)), None);
         assert_eq!(dialect_for(&identity(0x0068_6578, 0xAAAA_0001)), None);
+        assert_eq!(dialect_for(&identity(0x0068_6578, 0x6C64_BC79)), None);
     }
 
     #[test]
