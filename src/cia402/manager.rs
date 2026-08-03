@@ -37,6 +37,7 @@ use super::discovery::{identify_once, run_discovery, run_liveness_monitor};
 use super::events::{Cia402Event, EventStream, DEFAULT_EVENTS_CAPACITY};
 use super::heartbeat::run_hb_broadcast;
 use super::initialize::{run_initialize, InitializeOutcome};
+use super::known_devices;
 use super::motor_entry::MotorEntry;
 use super::sequences::{
     build_clear_error_writes, build_disable_writes, build_set_mode_writes,
@@ -279,6 +280,8 @@ impl Cia402Manager {
     /// - 与 identify / 其他 initialize 互斥。
     /// - 失败时 lifecycle 退回 `Identified`（identity 已知）/ `Unknown`，
     ///   电机端可能残留部分 TPDO 配置（v0.1 不主动撤销）；调用方可直接重试。
+    /// - 已知型号但 `0x1018:03` 低于 [`known_devices::check_revision`] 要求的，
+    ///   在发出任何 SDO 之前就拒绝：旧版对象字典与本驱动不兼容，重试没有意义。
     pub async fn initialize(&self, nid: u8) -> Result<()> {
         let entry = {
             let g = self.motors.read().unwrap();
@@ -304,6 +307,17 @@ impl Cia402Manager {
             })?;
             (inner.session_epoch, identity)
         };
+
+        // 固件版本门控：旧版对象字典下，本流程写的 0x2004 / 0x2040 根本不存在，
+        // 读 0x6076 / 0x2003:07 也会把定点整数当 REAL32 解出垃圾值。与其让它在
+        // configure 深处以 ObjectDoesNotExist 中止并被上层反复重试，不如在这里
+        // 一次性拒绝，并把实际 revision 报给用户。
+        if let Err(unsupported) = known_devices::check_revision(&expected_identity) {
+            return Err(Error::DeviceOperationRejected {
+                nid,
+                reason: unsupported.to_string(),
+            });
+        }
 
         match run_initialize(
             self.bus.as_ref(),
@@ -1869,6 +1883,41 @@ mod tests {
             ((1, 0x2001, 4), vec![vec![u8::from(brs)]]),
             ((42, 0x1018, 1), vec![]),
         ]
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_unsupported_revision_before_touching_the_bus() {
+        let bus = Arc::new(ScriptedSettingsBus::new(motor_settings_values(
+            1, 5_000_000, false,
+        )));
+        let manager = test_manager(bus.clone());
+        // add_online_entry 建的 entry 是 revision 0，低于该 vendor 要求的 8。
+        add_online_entry(
+            &manager,
+            1,
+            MOTOR_VENDOR,
+            MOTOR_PRODUCT,
+            NmtState::PreOperational,
+        );
+
+        let error = manager
+            .initialize(1)
+            .await
+            .expect_err("an outdated object dictionary must not be initialized");
+        let text = error.to_string();
+        assert!(text.contains("revision 0"), "{text}");
+        assert!(text.contains(">= 8"), "{text}");
+        // 门控必须发生在任何 NMT/SDO 之前：旧固件重试再多次也不会变得可用。
+        assert!(
+            bus.requests().is_empty(),
+            "rejected node must not receive any traffic, got {:?}",
+            bus.requests()
+        );
+        assert_eq!(
+            entry(&manager, 1).inner.lock().unwrap().lifecycle,
+            MotorLifecycle::Identified,
+            "a rejected initialize must leave the lifecycle untouched"
+        );
     }
 
     #[tokio::test]

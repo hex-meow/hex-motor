@@ -536,9 +536,19 @@ async fn read_runtime_constants(
     // 0x6076 Motor Peak Torque：设备对象字典规定为 REAL32，单位 **Nm**。
     // 直接缓存，不做单位换算。
     match sdo::upload_f32(bus, nid, 0x6076, 0, sdo_timeout).await {
-        Ok(nm) => {
+        Ok(nm) if is_plausible_real32(nm) && nm > 0.0 => {
             log::info!("nid 0x{nid:02X}: 0x6076 (Motor Peak Torque) = {nm} Nm");
             entry.inner.lock().unwrap().peak_torque_nm = Some(nm);
+        }
+        Ok(nm) => {
+            log::warn!(
+                "nid 0x{nid:02X}: 0x6076 (Motor Peak Torque) is not a plausible REAL32 \
+                 ({nm} Nm, bits 0x{:08X}); refusing to cache it, Torque-mode target writes \
+                 will be unavailable. A non-positive or subnormal value normally means the \
+                 device encodes this object as an integer, i.e. its object dictionary is an \
+                 older revision than this driver implements",
+                nm.to_bits()
+            );
         }
         Err(e) => {
             log::warn!(
@@ -550,9 +560,17 @@ async fn read_runtime_constants(
 
     // 0x2003:07 MIT KP/KD Factor：REAL32。物理 Kp [Nm/Rev] = kp_int × factor。
     match sdo::upload_f32(bus, nid, 0x2003, 0x07, sdo_timeout).await {
-        Ok(factor) => {
+        Ok(factor) if is_plausible_real32(factor) && factor > 0.0 => {
             log::info!("nid 0x{nid:02X}: 0x2003:07 (MIT KP/KD Factor) = {factor}");
             entry.inner.lock().unwrap().mit_kp_kd_factor = Some(factor);
+        }
+        Ok(factor) => {
+            log::warn!(
+                "nid 0x{nid:02X}: 0x2003:07 (MIT KP/KD Factor) is not a plausible REAL32 \
+                 ({factor}, bits 0x{:08X}); refusing to cache it, Mit-mode target writes \
+                 will be unavailable",
+                factor.to_bits()
+            );
         }
         Err(e) => {
             log::warn!(
@@ -561,6 +579,16 @@ async fn read_runtime_constants(
             );
         }
     }
+}
+
+/// 一个 REAL32 读数看起来像不像"真的是 REAL32"。
+///
+/// 这些厂商常量都是出厂标定的正常量级物理量，永远不会是 NaN/Inf，也不会落进
+/// 非规格化区间。把整数位模式当 f32 解出来的值恰恰几乎总是非规格化的（例如
+/// 整数 8658 → 1.2e-41），所以这一条既能挡住传输错误，也能挡住"对象其实是整数
+/// 类型"的对象字典不匹配 —— 缓存一个 1e-41 的峰值力矩比读不到更危险。
+fn is_plausible_real32(v: f32) -> bool {
+    v.is_normal()
 }
 
 /// 一次性把 recipe 编译出的所有 SDO 写顺序下发给电机。
