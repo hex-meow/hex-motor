@@ -1,6 +1,6 @@
 [package]
 name = "hex-motor"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["kisonhe <kisonhe@hexmeow.com>"]
 description = "Rust driver library for HEX-MECHA motors over CANopen, built on can-transport."
