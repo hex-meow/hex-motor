@@ -23,6 +23,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::meow_motor::model_for_identity;
+use crate::types::MotorIdentity;
 
 use super::codec::{decode_tpdo1, decode_tpdo2, status_word_to_logic, Tpdo1Frame, Tpdo2Frame};
 use super::events::Cia402Event;
@@ -123,17 +124,26 @@ fn handle_frame(
     // owner, but Meow Motor TPDOs belong exclusively to its dedicated driver.
     // Gate on the complete identity tuple so an unrelated short PDO can never
     // be reclassified by payload length alone.
-    if entry
-        .inner
-        .lock()
-        .unwrap()
-        .identity
-        .as_ref()
-        .and_then(model_for_identity)
-        .is_some()
-    {
-        return;
-    }
+    //
+    // The same reasoning extends to devices that are not motors at all. A bus may
+    // legitimately carry other CANopen device classes — a lift driver (HexMeow vendor,
+    // product `lft`) shares a bus with a chassis, and its TPDO1 is an 8-byte
+    // position/timestamp/mode/status frame, not the ≥12-byte CiA402 motor layout.
+    // Decoding those as motor telemetry emits a "bad length" warning at the device's
+    // full TPDO rate (100 Hz for the lift). That is our misclassification, not a device
+    // fault, and downstream log forwarders republish the flood to operators. So: keep
+    // tracking liveness for the shared inventory, but never decode and never warn.
+    let is_cia402_motor = {
+        let inner = entry.inner.lock().unwrap();
+        match inner.identity.as_ref() {
+            // The dedicated Meow Motor driver owns these frames exclusively.
+            Some(identity) if model_for_identity(identity).is_some() => return,
+            // Identity known and not a legacy HexFellow CiA402 motor ⇒ different class.
+            Some(identity) => identity.vendor_id == MotorIdentity::HEXFELLOW_VENDOR_ID,
+            // Identity not read yet: keep the historical behaviour rather than guess.
+            None => true,
+        }
+    };
 
     let now = Instant::now();
 
@@ -149,6 +159,9 @@ fn handle_frame(
 
         let mut error_event: Option<Cia402Event> = None;
         match kind {
+            // Liveness is already recorded above; a non-CiA402 device class contributes
+            // nothing further and must not be parsed with the motor layout.
+            _ if !is_cia402_motor => {}
             TpdoKind::Tpdo1 => {
                 if let Some(f) = decode_tpdo1(frame.data()) {
                     apply_tpdo1(&mut inner, f, velocity_window);
@@ -265,5 +278,88 @@ mod tests {
         assert!(inner.last_tpdo.is_none());
         assert!(!inner.online);
         assert_eq!(inner.measurements, Default::default());
+    }
+
+    /// A non-motor CANopen device (HexMeow lift driver, 8-byte TPDO1) shares the bus with
+    /// a chassis. Its frames must count for liveness but must never be parsed with the
+    /// CiA402 motor layout — doing so warned at the device's full 100 Hz TPDO rate, and
+    /// log forwarders republished that flood to operators.
+    #[test]
+    fn non_motor_device_class_is_tracked_for_liveness_but_never_decoded() {
+        const HEXMEOW_VENDOR: u32 = MotorIdentity::HEXMEOW_VENDOR_ID;
+        const LIFT_PRODUCT: u32 = 0x006C_6674; // ASCII family "lft"
+
+        let entry = Arc::new(MotorEntry::new(20));
+        entry.inner.lock().unwrap().identity = Some(MotorIdentity {
+            node_id: 20,
+            vendor_id: HEXMEOW_VENDOR,
+            product_code: LIFT_PRODUCT,
+            revision_number: 1,
+            serial_number: 0x0111_B49A,
+            product_name: Some("hexmeow-lift-driver".into()),
+        });
+        let motors = Arc::new(RwLock::new(HashMap::from([(20, entry.clone())])));
+        let (events, mut rx) = broadcast::channel(4);
+        // Real lift TPDO1: position f32 | timestamp u16 | ModeDisplay u8 | StatusWord u8.
+        let frame = CanFrame::new_data(0x194u16, &[0, 0, 0, 0, 0x12, 0x34, 0x01, 0x03]).unwrap();
+
+        handle_frame(
+            Ok(frame),
+            TpdoKind::Tpdo1,
+            &motors,
+            &events,
+            Duration::from_millis(15),
+        );
+
+        let inner = entry.inner.lock().unwrap();
+        // Liveness still tracked: the shared inventory legitimately owns heartbeat/online.
+        assert!(inner.last_tpdo.is_some(), "非电机设备仍应计入 liveness");
+        assert!(inner.online);
+        // But nothing was decoded with the motor layout.
+        assert_eq!(
+            inner.measurements,
+            Default::default(),
+            "8 字节 lift TPDO 绝不能被按电机布局解出测量值"
+        );
+        assert!(inner.logic.is_none(), "不得为非电机设备推导 CiA402 logic");
+        // Coming online is a real inventory event and stays.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Cia402Event::NodeOnline { nid: 20 })
+        ));
+    }
+
+    /// A legacy HexFellow motor keeps the historical decode path.
+    #[test]
+    fn legacy_hexfellow_motor_still_decodes() {
+        let entry = Arc::new(MotorEntry::new(3));
+        entry.inner.lock().unwrap().identity = Some(MotorIdentity {
+            node_id: 3,
+            vendor_id: MotorIdentity::HEXFELLOW_VENDOR_ID,
+            product_code: 0x1234,
+            revision_number: 1,
+            serial_number: 7,
+            product_name: None,
+        });
+        let motors = Arc::new(RwLock::new(HashMap::from([(3, entry.clone())])));
+        let (events, _) = broadcast::channel(4);
+        let frame = CanFrame::new_fd(0x183, &[0u8; 12], true).unwrap();
+
+        handle_frame(
+            Ok(frame),
+            TpdoKind::Tpdo1,
+            &motors,
+            &events,
+            Duration::from_millis(15),
+        );
+
+        let inner = entry.inner.lock().unwrap();
+        assert!(inner.last_tpdo.is_some());
+        assert!(inner.online);
+        assert_ne!(
+            inner.measurements,
+            Default::default(),
+            "合法 12B 电机 TPDO1 仍应被解码"
+        );
     }
 }
