@@ -23,7 +23,6 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::meow_motor::model_for_identity;
-use crate::types::MotorIdentity;
 
 use super::codec::{decode_tpdo1, decode_tpdo2, status_word_to_logic, Tpdo1Frame, Tpdo2Frame};
 use super::events::Cia402Event;
@@ -34,6 +33,36 @@ use super::types::Logic;
 const TPDO_FC_MASK: u16 = 0x780;
 const TPDO1_BASE: u16 = 0x180;
 const TPDO2_BASE: u16 = 0x280;
+
+/// "这个节点的 TPDO 解不出来" 的告警限流。
+///
+/// 一条总线上可以合法地跑非 CiA402 电机的 CANopen 设备(例如与底盘共线的 lift driver,
+/// 它的 TPDO1 是 8 字节的 位置/时间戳/模式/状态)。它们会以设备自己的 TPDO 速率
+/// (lift 是 100Hz)持续触发 "bad length",把日志刷爆,而下游还会把 WARN 转发给运维。
+///
+/// **不能靠 vendor id 猜"这是不是电机"来跳过解码** —— 2026-08-09 就是这么错过一次:
+/// 车队里的 CiA402 电机是第三方 vendor `0x4859444C`,被误判成非电机后 TPDO 不再解码,
+/// status word 与 logic 永远是 None,机械臂直接起不来。设备类别不可靠,**解码照旧**,
+/// 只把重复告警压掉:每个 (nid, tpdo) 首次告警后静默一段时间。
+#[derive(Default)]
+struct UndecodableWarnLimiter {
+    last: HashMap<(u8, u8), Instant>,
+}
+
+impl UndecodableWarnLimiter {
+    const QUIET: Duration = Duration::from_secs(60);
+
+    fn should_warn(&mut self, nid: u8, tpdo: u8) -> bool {
+        let now = Instant::now();
+        match self.last.get(&(nid, tpdo)) {
+            Some(prev) if now.duration_since(*prev) < Self::QUIET => false,
+            _ => {
+                self.last.insert((nid, tpdo), now);
+                true
+            }
+        }
+    }
+}
 
 /// 哪条 TPDO 被收到了 —— 决定按 12B 还是 10B 解码。
 #[derive(Copy, Clone)]
@@ -79,14 +108,16 @@ pub(crate) async fn run_tpdo_listener(
         }
     };
 
+    let mut undecodable = UndecodableWarnLimiter::default();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 log::debug!("TPDO listener cancelled");
                 return;
             }
-            res = rx1.recv() => handle_frame(res, TpdoKind::Tpdo1, &motors, &events_tx, velocity_window),
-            res = rx2.recv() => handle_frame(res, TpdoKind::Tpdo2, &motors, &events_tx, velocity_window),
+            res = rx1.recv() => handle_frame(res, TpdoKind::Tpdo1, &motors, &events_tx, velocity_window, &mut undecodable),
+            res = rx2.recv() => handle_frame(res, TpdoKind::Tpdo2, &motors, &events_tx, velocity_window, &mut undecodable),
         }
     }
 }
@@ -97,6 +128,7 @@ fn handle_frame(
     motors: &Arc<RwLock<HashMap<u8, Arc<MotorEntry>>>>,
     events_tx: &broadcast::Sender<Cia402Event>,
     velocity_window: Duration,
+    undecodable: &mut UndecodableWarnLimiter,
 ) {
     let frame = match res {
         Ok(f) => f,
@@ -124,26 +156,17 @@ fn handle_frame(
     // owner, but Meow Motor TPDOs belong exclusively to its dedicated driver.
     // Gate on the complete identity tuple so an unrelated short PDO can never
     // be reclassified by payload length alone.
-    //
-    // The same reasoning extends to devices that are not motors at all. A bus may
-    // legitimately carry other CANopen device classes — a lift driver (HexMeow vendor,
-    // product `lft`) shares a bus with a chassis, and its TPDO1 is an 8-byte
-    // position/timestamp/mode/status frame, not the ≥12-byte CiA402 motor layout.
-    // Decoding those as motor telemetry emits a "bad length" warning at the device's
-    // full TPDO rate (100 Hz for the lift). That is our misclassification, not a device
-    // fault, and downstream log forwarders republish the flood to operators. So: keep
-    // tracking liveness for the shared inventory, but never decode and never warn.
-    let is_cia402_motor = {
-        let inner = entry.inner.lock().unwrap();
-        match inner.identity.as_ref() {
-            // The dedicated Meow Motor driver owns these frames exclusively.
-            Some(identity) if model_for_identity(identity).is_some() => return,
-            // Identity known and not a legacy HexFellow CiA402 motor ⇒ different class.
-            Some(identity) => identity.vendor_id == MotorIdentity::HEXFELLOW_VENDOR_ID,
-            // Identity not read yet: keep the historical behaviour rather than guess.
-            None => true,
-        }
-    };
+    if entry
+        .inner
+        .lock()
+        .unwrap()
+        .identity
+        .as_ref()
+        .and_then(model_for_identity)
+        .is_some()
+    {
+        return;
+    }
 
     let now = Instant::now();
 
@@ -159,15 +182,13 @@ fn handle_frame(
 
         let mut error_event: Option<Cia402Event> = None;
         match kind {
-            // Liveness is already recorded above; a non-CiA402 device class contributes
-            // nothing further and must not be parsed with the motor layout.
-            _ if !is_cia402_motor => {}
             TpdoKind::Tpdo1 => {
                 if let Some(f) = decode_tpdo1(frame.data()) {
                     apply_tpdo1(&mut inner, f, velocity_window);
-                } else {
+                } else if undecodable.should_warn(nid, 1) {
                     log::warn!(
-                        "TPDO1 from nid 0x{nid:02X}: bad length {} (want >=12)",
+                        "TPDO1 from nid 0x{nid:02X}: bad length {} (want >=12); \
+                         further identical warnings for this node are suppressed",
                         frame.data().len()
                     );
                 }
@@ -191,9 +212,10 @@ fn handle_frame(
                             });
                         }
                     }
-                } else {
+                } else if undecodable.should_warn(nid, 2) {
                     log::warn!(
-                        "TPDO2 from nid 0x{nid:02X}: bad length {} (want >=10)",
+                        "TPDO2 from nid 0x{nid:02X}: bad length {} (want >=10); \
+                         further identical warnings for this node are suppressed",
                         frame.data().len()
                     );
                 }
@@ -264,6 +286,7 @@ mod tests {
         });
         let motors = Arc::new(RwLock::new(HashMap::from([(1, entry.clone())])));
         let (events, _) = broadcast::channel(4);
+        let mut limiter = UndecodableWarnLimiter::default();
         let frame = CanFrame::new_fd(0x181, &[0; 8], true).unwrap();
 
         handle_frame(
@@ -272,6 +295,7 @@ mod tests {
             &motors,
             &events,
             Duration::from_millis(15),
+            &mut limiter,
         );
 
         let inner = entry.inner.lock().unwrap();
@@ -280,27 +304,75 @@ mod tests {
         assert_eq!(inner.measurements, Default::default());
     }
 
-    /// A non-motor CANopen device (HexMeow lift driver, 8-byte TPDO1) shares the bus with
-    /// a chassis. Its frames must count for liveness but must never be parsed with the
-    /// CiA402 motor layout — doing so warned at the device's full 100 Hz TPDO rate, and
-    /// log forwarders republished that flood to operators.
+    /// **回归护栏(2026-08-09)**:第三方 vendor `0x4859444C` 的 CiA402 电机(车队实际在用的
+    /// 那批)必须照常解码。上一版按 vendor id 猜"是不是电机"、只放行 HexFellow,把这批
+    /// 误判成非电机 → TPDO 不再解码 → status word / logic 恒为 None → 机械臂起不来
+    /// ("SDO fault state cleared but TPDO2 did not converge (cached sw=None, logic=None)")。
+    /// 设备类别不可从 vendor 推断,解码必须对所有已登记节点一视同仁。
     #[test]
-    fn non_motor_device_class_is_tracked_for_liveness_but_never_decoded() {
-        const HEXMEOW_VENDOR: u32 = MotorIdentity::HEXMEOW_VENDOR_ID;
-        const LIFT_PRODUCT: u32 = 0x006C_6674; // ASCII family "lft"
+    fn third_party_vendor_cia402_motor_still_decodes() {
+        const THIRD_PARTY_VENDOR: u32 = 0x4859_444C;
 
+        let entry = Arc::new(MotorEntry::new(1));
+        entry.inner.lock().unwrap().identity = Some(MotorIdentity {
+            node_id: 1,
+            vendor_id: THIRD_PARTY_VENDOR,
+            product_code: 0xAAAA_0001,
+            revision_number: 8,
+            serial_number: 1,
+            product_name: None,
+        });
+        let motors = Arc::new(RwLock::new(HashMap::from([(1, entry.clone())])));
+        let (events, _) = broadcast::channel(4);
+        let mut limiter = UndecodableWarnLimiter::default();
+        // 合法 10B TPDO2 → 必须解出 status word 并推出 logic。
+        let frame = CanFrame::new_fd(0x281, &[0u8; 10], true).unwrap();
+
+        handle_frame(
+            Ok(frame),
+            TpdoKind::Tpdo2,
+            &motors,
+            &events,
+            Duration::from_millis(15),
+            &mut limiter,
+        );
+
+        let inner = entry.inner.lock().unwrap();
+        assert!(inner.online);
+        assert!(
+            inner.measurements.status_word.is_some(),
+            "第三方 vendor 的 CiA402 电机必须照常解码,否则 initialize 永远等不到 TPDO2 收敛"
+        );
+        assert!(inner.logic.is_some(), "logic 必须被推导出来");
+    }
+
+    /// 非电机设备(如与底盘共线的 lift,8 字节 TPDO1)解不出来是正常的:liveness 照记,
+    /// 重复告警被压掉,但**不跳过解码尝试** —— 跳过与否不该由我们猜设备类别来决定。
+    #[test]
+    fn undecodable_frames_warn_once_then_stay_quiet() {
+        let mut limiter = UndecodableWarnLimiter::default();
+        assert!(limiter.should_warn(0x14, 1), "首次必须告警");
+        assert!(!limiter.should_warn(0x14, 1), "同一 (nid,tpdo) 立即重复应静默");
+        assert!(limiter.should_warn(0x14, 2), "另一条 TPDO 独立计时");
+        assert!(limiter.should_warn(0x15, 1), "另一个节点独立计时");
+    }
+
+    /// 非电机设备仍计入 liveness(共享清单本就拥有 heartbeat/online)。
+    #[test]
+    fn non_motor_device_is_still_tracked_for_liveness() {
         let entry = Arc::new(MotorEntry::new(20));
         entry.inner.lock().unwrap().identity = Some(MotorIdentity {
             node_id: 20,
-            vendor_id: HEXMEOW_VENDOR,
-            product_code: LIFT_PRODUCT,
+            vendor_id: MotorIdentity::HEXMEOW_VENDOR_ID,
+            product_code: 0x006C_6674, // ASCII "lft"
             revision_number: 1,
             serial_number: 0x0111_B49A,
             product_name: Some("hexmeow-lift-driver".into()),
         });
         let motors = Arc::new(RwLock::new(HashMap::from([(20, entry.clone())])));
         let (events, mut rx) = broadcast::channel(4);
-        // Real lift TPDO1: position f32 | timestamp u16 | ModeDisplay u8 | StatusWord u8.
+        let mut limiter = UndecodableWarnLimiter::default();
+        // 真实 lift TPDO1:8 字节,按电机布局解不出来。
         let frame = CanFrame::new_data(0x194u16, &[0, 0, 0, 0, 0x12, 0x34, 0x01, 0x03]).unwrap();
 
         handle_frame(
@@ -309,57 +381,16 @@ mod tests {
             &motors,
             &events,
             Duration::from_millis(15),
+            &mut limiter,
         );
 
         let inner = entry.inner.lock().unwrap();
-        // Liveness still tracked: the shared inventory legitimately owns heartbeat/online.
-        assert!(inner.last_tpdo.is_some(), "非电机设备仍应计入 liveness");
+        assert!(inner.last_tpdo.is_some());
         assert!(inner.online);
-        // But nothing was decoded with the motor layout.
-        assert_eq!(
-            inner.measurements,
-            Default::default(),
-            "8 字节 lift TPDO 绝不能被按电机布局解出测量值"
-        );
-        assert!(inner.logic.is_none(), "不得为非电机设备推导 CiA402 logic");
-        // Coming online is a real inventory event and stays.
         assert!(matches!(
             rx.try_recv(),
             Ok(Cia402Event::NodeOnline { nid: 20 })
         ));
     }
 
-    /// A legacy HexFellow motor keeps the historical decode path.
-    #[test]
-    fn legacy_hexfellow_motor_still_decodes() {
-        let entry = Arc::new(MotorEntry::new(3));
-        entry.inner.lock().unwrap().identity = Some(MotorIdentity {
-            node_id: 3,
-            vendor_id: MotorIdentity::HEXFELLOW_VENDOR_ID,
-            product_code: 0x1234,
-            revision_number: 1,
-            serial_number: 7,
-            product_name: None,
-        });
-        let motors = Arc::new(RwLock::new(HashMap::from([(3, entry.clone())])));
-        let (events, _) = broadcast::channel(4);
-        let frame = CanFrame::new_fd(0x183, &[0u8; 12], true).unwrap();
-
-        handle_frame(
-            Ok(frame),
-            TpdoKind::Tpdo1,
-            &motors,
-            &events,
-            Duration::from_millis(15),
-        );
-
-        let inner = entry.inner.lock().unwrap();
-        assert!(inner.last_tpdo.is_some());
-        assert!(inner.online);
-        assert_ne!(
-            inner.measurements,
-            Default::default(),
-            "合法 12B 电机 TPDO1 仍应被解码"
-        );
-    }
 }
