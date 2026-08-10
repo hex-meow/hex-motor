@@ -9,7 +9,8 @@
 //! M4+ 会在此基础上叠加 `set_mode()` / `set_target()` 等。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use can_transport::CanBus;
@@ -39,6 +40,7 @@ use super::heartbeat::run_hb_broadcast;
 use super::initialize::{run_initialize, InitializeOutcome};
 use super::known_devices;
 use super::motor_entry::MotorEntry;
+use super::pdo_profile::PdoProfile;
 use super::sequences::{
     build_clear_error_writes, build_disable_writes, build_set_mode_writes,
     build_set_target_writes, SetTargetContext, INTER_WRITE_DELAY,
@@ -72,9 +74,13 @@ pub struct Cia402ManagerOptions {
     /// 默认 200 ms。TPDO 默认 ~20 ms 一发，给 10x 容错。
     pub initialized_stale_threshold: Duration,
 
-    /// 速度滤波的滑动时间窗。TPDO1 ~1 kHz，默认 15 ms（≈15 个样本做最小二乘
-    /// 斜率）。调大更平滑、相位滞后更多；调小更跟手、噪声更大。
-    pub velocity_window: Duration,
+    /// 本总线的 TPDO1 节拍（事件定时器 + inhibit + 速度窗口）。默认 1 kHz。
+    ///
+    /// 这里给的是**构造期默认值**。总线的真实速率取决于数据段波特率和 BRS，而那要
+    /// 等设备被发现、`0x1018`/`0x2001` 读回之后才知道 —— 那时 manager 早已存在
+    /// （审计读的就是 manager 的缓存）。所以上层算出结论后用
+    /// [`Cia402Manager::freeze_pdo_profile`] 冻结一次，覆盖这里的默认值。
+    pub pdo_profile: PdoProfile,
 
     /// `initialize()` 里清心跳/CiA402 故障的最多尝试次数。固件清故障有个随
     /// "心跳丢失→恢复"翻转的相位、单次约一半概率失败，每次尝试翻一次相位，
@@ -101,7 +107,7 @@ impl Default for Cia402ManagerOptions {
             events_capacity: DEFAULT_EVENTS_CAPACITY,
             motor_heartbeat_period: Duration::from_millis(500),
             initialized_stale_threshold: Duration::from_millis(200),
-            velocity_window: Duration::from_millis(15),
+            pdo_profile: PdoProfile::default(),
             init_fault_clear_attempts: 6,
             broadcast_heartbeat: true,
         }
@@ -118,6 +124,11 @@ pub struct Cia402Manager {
     inflight_ops: Arc<StdMutex<HashSet<u8>>>,
     events_tx: broadcast::Sender<Cia402Event>,
     cancel: CancellationToken,
+    /// 上层冻结的本总线 PDO 节拍。空 = 还没冻结，用 `opts.pdo_profile`。
+    pdo_profile: OnceLock<PdoProfile>,
+    /// 与 TPDO 监听 task 共享的速度窗口（纳秒）。task 在 `new` 里就 spawn 了，
+    /// 而 profile 要等 preflight 之后才冻结，所以这个值必须能在运行期改。
+    velocity_window_ns: Arc<AtomicU64>,
     /// 后台 task 句柄。`drop` 时通过 `cancel` 让它们退出，不在 drop 里 await。
     tasks: Vec<JoinHandle<()>>,
 }
@@ -198,11 +209,14 @@ impl Cia402Manager {
             opts.sdo_timeout,
             cancel.clone(),
         )));
+        let velocity_window_ns = Arc::new(AtomicU64::new(
+            opts.pdo_profile.velocity_window().as_nanos() as u64
+        ));
         tasks.push(tokio::spawn(run_tpdo_listener(
             bus.clone(),
             motors.clone(),
             events_tx.clone(),
-            opts.velocity_window,
+            velocity_window_ns.clone(),
             cancel.clone(),
         )));
         tasks.push(tokio::spawn(run_liveness_monitor(
@@ -220,8 +234,88 @@ impl Cia402Manager {
             inflight_ops,
             events_tx,
             cancel,
+            pdo_profile: OnceLock::new(),
+            velocity_window_ns,
             tasks,
         })
+    }
+
+    /// 本总线当前生效的 PDO 节拍：冻结过就是冻结值，否则是构造期默认值。
+    pub fn pdo_profile(&self) -> PdoProfile {
+        self.pdo_profile.get().copied().unwrap_or(self.opts.pdo_profile)
+    }
+
+    /// 冻结本总线的 PDO 节拍。**必须在第一个 `initialize()` 之前调用一次。**
+    ///
+    /// 速率是**每条物理总线**的属性，不是每个电机的：同线上的电机必须同节拍，
+    /// 否则带宽预算无从谈起。所以这里是一次性冻结，而不是 `initialize()` 的参数
+    /// —— 后者有几个电机就有几次传错的机会。
+    ///
+    /// 三条护栏，都是 fail closed：
+    /// - 已经有电机 `Initializing`/`Initialized` 时拒绝：那些电机的 TPDO1 已经按
+    ///   旧节拍配好了，此时改只会让同一条线上跑出两种速率，而且不会有任何报错。
+    /// - 二次冻结**同值**放行（`BusHost` 是共享的，重复审计会得出同一结论），
+    ///   **异值**报错。
+    /// - 周期必须显著快于 [`Cia402ManagerOptions::initialized_stale_threshold`]，
+    ///   否则正常节拍会被在线监控判成掉线。
+    pub fn freeze_pdo_profile(&self, profile: PdoProfile) -> Result<()> {
+        if let Some(frozen) = self.pdo_profile.get() {
+            return if *frozen == profile {
+                Ok(())
+            } else {
+                Err(Error::Internal(format!(
+                    "PDO profile already frozen as {frozen}; refusing to change it to {profile}"
+                )))
+            };
+        }
+
+        let period = Duration::from_millis(profile.event_timer_ms() as u64);
+        if period * 4 > self.opts.initialized_stale_threshold {
+            return Err(Error::Internal(format!(
+                "PDO profile {profile} is too slow for initialized_stale_threshold {:?}: \
+                 a healthy bus would be reported offline",
+                self.opts.initialized_stale_threshold
+            )));
+        }
+
+        let configured: Vec<u8> = {
+            let motors = self.motors.read().unwrap();
+            motors
+                .values()
+                .filter(|entry| {
+                    matches!(
+                        entry.inner.lock().unwrap().lifecycle,
+                        MotorLifecycle::Initializing | MotorLifecycle::Initialized
+                    )
+                })
+                .map(|entry| entry.node_id)
+                .collect()
+        };
+        if !configured.is_empty() {
+            return Err(Error::Internal(format!(
+                "cannot freeze the PDO profile after nodes {configured:02X?} were already \
+                 configured; their TPDO1 still runs at the previous rate"
+            )));
+        }
+
+        // 与上面的 lifecycle 检查之间没有锁保护：`freeze_pdo_profile` 的契约就是
+        // "在任何 initialize 之前调用一次"，并发调 initialize 属于调用方的错误。
+        // 这里的检查是为了把那个错误从"静默的混合速率"变成"启动就报错"。
+        if self.pdo_profile.set(profile).is_err() {
+            let frozen = self.pdo_profile.get().copied().unwrap_or_default();
+            if frozen != profile {
+                return Err(Error::Internal(format!(
+                    "PDO profile already frozen as {frozen}; refusing to change it to {profile}"
+                )));
+            }
+            return Ok(());
+        }
+        self.velocity_window_ns.store(
+            profile.velocity_window().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        log::info!("PDO profile frozen: {profile}");
+        Ok(())
     }
 
     /// 当前可见的所有电机快照。
@@ -324,6 +418,7 @@ impl Cia402Manager {
             entry.clone(),
             &self.events_tx,
             &self.opts,
+            self.pdo_profile(),
         )
         .await?
         {
@@ -376,7 +471,15 @@ impl Cia402Manager {
                 )
                 .await?;
 
-                match run_initialize(self.bus.as_ref(), entry, &self.events_tx, &self.opts).await? {
+                match run_initialize(
+                    self.bus.as_ref(),
+                    entry,
+                    &self.events_tx,
+                    &self.opts,
+                    self.pdo_profile(),
+                )
+                .await?
+                {
                     InitializeOutcome::Initialized => {
                         log::info!(
                             "nid 0x{nid:02X}: initialize recovered after one Reset Communication"
@@ -1821,6 +1924,9 @@ mod tests {
             mode_confirm_timeout: Duration::from_millis(50),
             ..Default::default()
         };
+        let velocity_window_ns = Arc::new(AtomicU64::new(
+            opts.pdo_profile.velocity_window().as_nanos() as u64
+        ));
         Cia402Manager {
             bus,
             opts,
@@ -1828,6 +1934,8 @@ mod tests {
             inflight_ops: Arc::new(StdMutex::new(HashSet::new())),
             events_tx,
             cancel: CancellationToken::new(),
+            pdo_profile: OnceLock::new(),
+            velocity_window_ns,
             tasks: Vec::new(),
         }
     }
@@ -1860,6 +1968,98 @@ mod tests {
 
     fn entry(manager: &Cia402Manager, nid: u8) -> Arc<MotorEntry> {
         manager.motors.read().unwrap()[&nid].clone()
+    }
+
+    #[tokio::test]
+    async fn unfrozen_manager_keeps_the_historical_one_kilohertz_default() {
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        assert_eq!(manager.pdo_profile(), PdoProfile::default());
+        assert_eq!(manager.pdo_profile().event_timer_ms(), 1);
+    }
+
+    #[tokio::test]
+    async fn freezing_is_idempotent_for_the_same_value_and_fatal_for_a_different_one() {
+        // `BusHost` 是共享的，同一条总线可能被审计两次；两次得出同一结论必须放行，
+        // 得出不同结论说明总线在运行中变了形，必须报错而不是悄悄改速率。
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        let slow = PdoProfile::from_event_timer_ms(4).unwrap();
+        manager.freeze_pdo_profile(slow).unwrap();
+        assert_eq!(manager.pdo_profile(), slow);
+        manager.freeze_pdo_profile(slow).unwrap();
+
+        let faster = PdoProfile::from_event_timer_ms(2).unwrap();
+        assert!(manager.freeze_pdo_profile(faster).is_err());
+        assert_eq!(manager.pdo_profile(), slow, "失败的冻结不能改动已冻结值");
+    }
+
+    #[tokio::test]
+    async fn freezing_updates_the_live_velocity_window() {
+        // 窗口必须跟着节拍走，否则 250 Hz 下 15 ms 窗口只剩 3.75 个样本。
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        assert_eq!(
+            manager.velocity_window_ns.load(Ordering::Relaxed),
+            Duration::from_millis(15).as_nanos() as u64
+        );
+        manager
+            .freeze_pdo_profile(PdoProfile::from_event_timer_ms(4).unwrap())
+            .unwrap();
+        assert_eq!(
+            manager.velocity_window_ns.load(Ordering::Relaxed),
+            Duration::from_millis(60).as_nanos() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn freezing_after_a_node_is_configured_is_rejected() {
+        // 这条是本次改动最重要的护栏：晚到的冻结不会有任何症状 —— 已配好的电机
+        // 继续按旧节拍发，新配的按新节拍发，同一条线上跑出两种速率，带宽预算失效。
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        add_online_entry(&manager, 1, MOTOR_VENDOR, MOTOR_PRODUCT, NmtState::PreOperational);
+        entry(&manager, 1).inner.lock().unwrap().lifecycle = MotorLifecycle::Initialized;
+
+        let error = manager
+            .freeze_pdo_profile(PdoProfile::from_event_timer_ms(4).unwrap())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("already configured"),
+            "错误信息要指出是哪几个节点已经配过了: {error}"
+        );
+        assert_eq!(manager.pdo_profile(), PdoProfile::default());
+    }
+
+    #[tokio::test]
+    async fn a_period_too_slow_for_the_stale_threshold_is_rejected() {
+        // 200 ms 的在线判定下，50 ms 周期只有 4 倍余量，再慢健康总线会被判掉线。
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        assert_eq!(
+            manager.opts.initialized_stale_threshold,
+            Duration::from_millis(200)
+        );
+        manager
+            .freeze_pdo_profile(PdoProfile::from_event_timer_ms(50).unwrap())
+            .unwrap();
+
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        assert!(manager
+            .freeze_pdo_profile(PdoProfile::from_event_timer_ms(51).unwrap())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_frozen_profile_reaches_the_tpdo1_recipe() {
+        // 端到端一步：冻结的节拍必须真的出现在写给设备的 SDO 值里，否则整条链路
+        // 看起来配好了、线上还是 1 kHz。
+        let manager = test_manager(Arc::new(ScriptedSettingsBus::new([])));
+        manager
+            .freeze_pdo_profile(PdoProfile::from_event_timer_ms(4).unwrap())
+            .unwrap();
+        let recipe = super::super::initialize::tpdo1_recipe(0x15, manager.pdo_profile());
+        assert_eq!(recipe.comm.event_timer_ms, 4);
+        assert_eq!(recipe.comm.inhibit_time_x100us, 35);
+        assert_eq!(recipe.comm.transmission_type, 255);
+        assert_eq!(recipe.cob_id, 0x195);
+        // 映射不能被节拍影响 —— 只有通信参数跟着走。
+        assert_eq!(recipe.entries, super::super::initialize::DEFAULT_TPDO1_ENTRIES.to_vec());
     }
 
     fn motor_settings_values(

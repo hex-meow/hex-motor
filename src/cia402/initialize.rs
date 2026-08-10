@@ -50,6 +50,7 @@ use crate::canopen::{
     sdo,
     tpdo_config::{build_tpdo_config_writes, TpdoCommParams, TpdoEntry, TpdoRecipe},
 };
+use super::pdo_profile::PdoProfile;
 use crate::error::{Error, Result};
 use crate::types::MotorIdentity;
 
@@ -138,13 +139,22 @@ pub const DEFAULT_TPDO2_COMM: TpdoCommParams = TpdoCommParams {
     event_timer_ms: 20,       // 50 Hz
 };
 
-/// 给指定 nid 构造默认 TPDO1 recipe (`cob_id = 0x180 + nid`)。
+/// 给指定 nid 构造默认 TPDO1 recipe (`cob_id = 0x180 + nid`)，1 kHz 节拍。
 pub fn default_tpdo1_recipe(nid: u8) -> TpdoRecipe {
+    tpdo1_recipe(nid, PdoProfile::default())
+}
+
+/// 按给定节拍构造 TPDO1 recipe。映射不变，只有通信参数跟着 profile 走。
+pub fn tpdo1_recipe(nid: u8, profile: PdoProfile) -> TpdoRecipe {
     TpdoRecipe {
         tpdo_index: 0,
         cob_id: 0x180 + nid as u16,
         entries: DEFAULT_TPDO1_ENTRIES.to_vec(),
-        comm: DEFAULT_TPDO1_COMM,
+        comm: TpdoCommParams {
+            transmission_type: DEFAULT_TPDO1_COMM.transmission_type,
+            inhibit_time_x100us: profile.inhibit_time_x100us(),
+            event_timer_ms: profile.event_timer_ms(),
+        },
     }
 }
 
@@ -281,6 +291,7 @@ pub(crate) async fn run_initialize(
     entry: Arc<MotorEntry>,
     events_tx: &broadcast::Sender<Cia402Event>,
     opts: &Cia402ManagerOptions,
+    pdo_profile: PdoProfile,
 ) -> Result<InitializeOutcome> {
     let nid = entry.node_id;
     let sdo_timeout = Some(opts.sdo_timeout);
@@ -328,8 +339,9 @@ pub(crate) async fn run_initialize(
     // 3. SDO 探活：读 0x6041 status_word
     let _sw = sdo::upload_u16(bus, nid, 0x6041, 0, sdo_timeout).await?;
 
-    // 4. 配置 TPDO1（高速）
-    apply_tpdo_recipe(bus, nid, &default_tpdo1_recipe(nid), sdo_timeout).await?;
+    // 4. 配置 TPDO1（高速）。节拍取本总线冻结的 profile —— 上层按数据段波特率和
+    //    BRS 算出的带宽预算就是在这一步落到设备上的。
+    apply_tpdo_recipe(bus, nid, &tpdo1_recipe(nid, pdo_profile), sdo_timeout).await?;
 
     // 5. 配置 TPDO2（低速）
     apply_tpdo_recipe(bus, nid, &default_tpdo2_recipe(nid), sdo_timeout).await?;

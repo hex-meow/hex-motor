@@ -15,6 +15,7 @@
 //! `last_tpdo`/`logic`/`measurements` 三者的一致性。详见 `DESIGN.md` §5。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -84,7 +85,9 @@ pub(crate) async fn run_tpdo_listener(
     bus: Arc<dyn CanBus>,
     motors: Arc<RwLock<HashMap<u8, Arc<MotorEntry>>>>,
     events_tx: broadcast::Sender<Cia402Event>,
-    velocity_window: Duration,
+    // 速度窗口。共享可变而非按值传入：本 task 在 `Cia402Manager::new` 里就启动了，
+    // 而窗口要跟着 TPDO1 节拍走，节拍要等 preflight 之后才冻结。
+    velocity_window_ns: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) {
     let mut rx1 = match bus
@@ -116,8 +119,14 @@ pub(crate) async fn run_tpdo_listener(
                 log::debug!("TPDO listener cancelled");
                 return;
             }
-            res = rx1.recv() => handle_frame(res, TpdoKind::Tpdo1, &motors, &events_tx, velocity_window, &mut undecodable),
-            res = rx2.recv() => handle_frame(res, TpdoKind::Tpdo2, &motors, &events_tx, velocity_window, &mut undecodable),
+            res = rx1.recv() => {
+                let window = Duration::from_nanos(velocity_window_ns.load(Ordering::Relaxed));
+                handle_frame(res, TpdoKind::Tpdo1, &motors, &events_tx, window, &mut undecodable)
+            }
+            res = rx2.recv() => {
+                let window = Duration::from_nanos(velocity_window_ns.load(Ordering::Relaxed));
+                handle_frame(res, TpdoKind::Tpdo2, &motors, &events_tx, window, &mut undecodable)
+            }
         }
     }
 }

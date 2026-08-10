@@ -20,6 +20,7 @@ use crate::canopen::nmt::{self, NmtCommand, NmtState};
 use crate::canopen::rpdo_config::{build_rpdo_config_writes, RpdoRecipe};
 use crate::canopen::sdo;
 use crate::canopen::tpdo_config::{build_tpdo_config_writes, SdoWrite, TpdoRecipe};
+use crate::cia402::PdoProfile;
 use crate::error::{Error, Result};
 use crate::types::MotorIdentity;
 
@@ -35,7 +36,6 @@ use super::identity::MeowMotorModel;
 use super::listener::run_tpdo_listener;
 use super::pdo::{
     compressed_mit_rpdo1_recipe, device_tpdo1_recipe, device_tpdo2_recipe, mode_rpdo2_recipe,
-    Tpdo1Rate,
 };
 use super::settings::{build_settings_update_plan, read_from_device, MeowMotorCanSettings};
 use super::types::{
@@ -94,7 +94,7 @@ pub struct SharedHostPdoConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeowMotorInitializeOptions {
-    pub tpdo1_rate: Tpdo1Rate,
+    pub pdo_profile: PdoProfile,
     /// Configure 0x1016 to consume the manager/external owner's heartbeat.
     pub configure_consumer_heartbeat: bool,
     /// Controller-only shared Host TPDO1/2 layout. GUI initialization normally leaves this None.
@@ -102,9 +102,9 @@ pub struct MeowMotorInitializeOptions {
 }
 
 impl MeowMotorInitializeOptions {
-    pub const fn new(tpdo1_rate: Tpdo1Rate) -> Self {
+    pub const fn new(pdo_profile: PdoProfile) -> Self {
         Self {
-            tpdo1_rate,
+            pdo_profile,
             configure_consumer_heartbeat: true,
             shared_host_pdo: None,
         }
@@ -113,7 +113,7 @@ impl MeowMotorInitializeOptions {
 
 impl Default for MeowMotorInitializeOptions {
     fn default() -> Self {
-        Self::new(Tpdo1Rate::Hz1000)
+        Self::new(PdoProfile::default())
     }
 }
 
@@ -285,8 +285,8 @@ impl MeowMotorManager {
         })
     }
 
-    pub async fn initialize(&self, node_id: u8, tpdo1_rate: Tpdo1Rate) -> Result<()> {
-        self.initialize_with_options(node_id, MeowMotorInitializeOptions::new(tpdo1_rate))
+    pub async fn initialize(&self, node_id: u8, pdo_profile: PdoProfile) -> Result<()> {
+        self.initialize_with_options(node_id, MeowMotorInitializeOptions::new(pdo_profile))
             .await
     }
 
@@ -363,7 +363,7 @@ impl MeowMotorManager {
         self.ensure_tpdo_recipe(
             entry,
             token,
-            &device_tpdo1_recipe(node_id, initialize_options.tpdo1_rate)?,
+            &device_tpdo1_recipe(node_id, initialize_options.pdo_profile)?,
         )
         .await?;
         self.ensure_tpdo_recipe(entry, token, &device_tpdo2_recipe(node_id)?)
@@ -1641,7 +1641,7 @@ mod tests {
     #[test]
     fn default_initialization_is_gui_safe_and_high_rate() {
         let options = MeowMotorInitializeOptions::default();
-        assert_eq!(options.tpdo1_rate, Tpdo1Rate::Hz1000);
+        assert_eq!(options.pdo_profile, PdoProfile::default());
         assert!(options.configure_consumer_heartbeat);
         assert!(options.shared_host_pdo.is_none());
     }

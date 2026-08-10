@@ -42,7 +42,7 @@ pub use crate::cia402::compressed_mit::{
 };
 pub use pdo::{
     compressed_mit_rpdo1_recipe, device_tpdo1_recipe, device_tpdo2_recipe, host_tpdo_cob_id,
-    mode_rpdo2_recipe, pdo_frame_kind, Tpdo1Rate,
+    mode_rpdo2_recipe, pdo_frame_kind,
 };
 pub use settings::{
     build_settings_update_plan, pdo_communication_save_write, MeowMotorCanSettings,

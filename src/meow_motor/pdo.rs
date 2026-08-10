@@ -4,6 +4,7 @@ use can_transport::FrameKind;
 
 use crate::canopen::rpdo_config::RpdoRecipe;
 use crate::canopen::tpdo_config::{TpdoCommParams, TpdoEntry, TpdoRecipe};
+use crate::cia402::PdoProfile;
 use crate::error::{Error, Result};
 
 const TPDO1_ENTRIES: [TpdoEntry; 3] = [
@@ -74,37 +75,6 @@ pub const fn pdo_frame_kind(payload_len: usize, brs: bool) -> FrameKind {
     }
 }
 
-/// 本次 session 选择的高频 Device TPDO1 周期。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Tpdo1Rate {
-    Hz500,
-    Hz1000,
-}
-
-impl Tpdo1Rate {
-    pub const fn hz(self) -> u16 {
-        match self {
-            Self::Hz500 => 500,
-            Self::Hz1000 => 1000,
-        }
-    }
-
-    pub const fn event_timer_ms(self) -> u16 {
-        match self {
-            Self::Hz500 => 2,
-            Self::Hz1000 => 1,
-        }
-    }
-
-    /// 初始值为周期的 50%；最终以真机 qualification 为准。
-    pub const fn inhibit_time_x100us(self) -> u16 {
-        match self {
-            Self::Hz500 => 10,
-            Self::Hz1000 => 5,
-        }
-    }
-}
-
 fn validate_node_id(node_id: u8, role: &'static str) -> Result<()> {
     if !(1..=127).contains(&node_id) {
         return Err(Error::Internal(format!(
@@ -128,8 +98,8 @@ fn validate_slot(slot: u8, total: u8) -> Result<()> {
     Ok(())
 }
 
-/// 指定 node 的 Device TPDO1：8 bytes，500 或 1000 Hz。
-pub fn device_tpdo1_recipe(node_id: u8, rate: Tpdo1Rate) -> Result<TpdoRecipe> {
+/// 指定 node 的 Device TPDO1：8 bytes，节拍由 [`PdoProfile`] 给定。
+pub fn device_tpdo1_recipe(node_id: u8, profile: PdoProfile) -> Result<TpdoRecipe> {
     validate_node_id(node_id, "motor")?;
     let recipe = TpdoRecipe {
         tpdo_index: 0,
@@ -137,8 +107,8 @@ pub fn device_tpdo1_recipe(node_id: u8, rate: Tpdo1Rate) -> Result<TpdoRecipe> {
         entries: TPDO1_ENTRIES.to_vec(),
         comm: TpdoCommParams {
             transmission_type: 255,
-            inhibit_time_x100us: rate.inhibit_time_x100us(),
-            event_timer_ms: rate.event_timer_ms(),
+            inhibit_time_x100us: profile.inhibit_time_x100us(),
+            event_timer_ms: profile.event_timer_ms(),
         },
     };
     recipe.validate()?;
@@ -239,17 +209,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_tpdo1_is_exactly_eight_bytes_at_both_rates() {
-        let fast = device_tpdo1_recipe(10, Tpdo1Rate::Hz1000).unwrap();
-        assert_eq!(fast.total_bytes(), 8);
-        assert_eq!(fast.comm.event_timer_ms, 1);
-        assert_eq!(fast.comm.inhibit_time_x100us, 5);
-        assert_eq!(fast.entries, TPDO1_ENTRIES);
-
-        let slow = device_tpdo1_recipe(10, Tpdo1Rate::Hz500).unwrap();
-        assert_eq!(slow.total_bytes(), 8);
-        assert_eq!(slow.comm.event_timer_ms, 2);
-        assert_eq!(slow.comm.inhibit_time_x100us, 10);
+    fn device_tpdo1_is_exactly_eight_bytes_at_every_rate() {
+        // 载荷宽度与节拍无关：降频只改通信参数，不改映射，否则解码器要跟着变。
+        for ms in [1u16, 2, 4] {
+            let recipe = device_tpdo1_recipe(10, PdoProfile::from_event_timer_ms(ms).unwrap())
+                .unwrap();
+            assert_eq!(recipe.total_bytes(), 8, "payload width @ {ms}ms");
+            assert_eq!(recipe.entries, TPDO1_ENTRIES);
+            assert_eq!(recipe.comm.event_timer_ms, ms);
+            assert_eq!(recipe.comm.inhibit_time_x100us, ms * 10 - 5);
+        }
     }
 
     #[test]
@@ -308,7 +277,7 @@ mod tests {
 
     #[test]
     fn recipes_reject_invalid_nodes_and_slots() {
-        assert!(device_tpdo1_recipe(0, Tpdo1Rate::Hz1000).is_err());
+        assert!(device_tpdo1_recipe(0, PdoProfile::default()).is_err());
         assert!(compressed_mit_rpdo1_recipe(6, 6, 10).is_err());
         assert!(mode_rpdo2_recipe(0, 0, 10).is_err());
         assert!(mode_rpdo2_recipe(0, 9, 10).is_err());

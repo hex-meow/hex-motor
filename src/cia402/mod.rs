@@ -11,6 +11,7 @@ pub mod compressed_mit;
 pub mod events;
 pub mod initialize;
 pub mod manager;
+pub mod pdo_profile;
 pub mod sequences;
 pub mod subscribe;
 pub mod types;
@@ -28,10 +29,11 @@ pub use compressed_mit::{
 };
 pub use events::{Cia402Event, EventStream, EventStreamItem};
 pub use initialize::{
-    default_tpdo1_recipe, default_tpdo2_recipe, DEFAULT_TPDO1_COMM, DEFAULT_TPDO1_ENTRIES,
-    DEFAULT_TPDO2_COMM, DEFAULT_TPDO2_ENTRIES,
+    default_tpdo1_recipe, default_tpdo2_recipe, tpdo1_recipe, DEFAULT_TPDO1_COMM,
+    DEFAULT_TPDO1_ENTRIES, DEFAULT_TPDO2_COMM, DEFAULT_TPDO2_ENTRIES,
 };
 pub use manager::{Cia402Manager, Cia402ManagerOptions};
+pub use pdo_profile::PdoProfile;
 pub use crate::types::{DeviceSettingsResult, DeviceSettingsUpdate};
 pub use subscribe::{
     OverflowPolicy, StatusStream, StatusStreamItem, StreamOptions, DEFAULT_STREAM_CAPACITY,

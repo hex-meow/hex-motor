@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 use can_transport::CanBus;
 use hex_motor::canopen::nmt::{self, NmtCommand, NmtState};
 use hex_motor::canopen::sdo;
+use hex_motor::cia402::PdoProfile;
 use hex_motor::meow_motor::{
     MeowMitTarget, MeowMotorCanSettingsStatus, MeowMotorInfo, MeowMotorInitializeOptions,
     MeowMotorLifecycle, MeowMotorLogic, MeowMotorManager, MeowMotorManagerOptions, MeowMotorMode,
-    MeowMotorTarget, MeowProfileLimits, SignedQ8_24, Tpdo1Rate,
+    MeowMotorTarget, MeowProfileLimits, SignedQ8_24,
 };
 
 mod common;
@@ -1154,12 +1155,13 @@ async fn verify_cleanup_fence(
     Ok(())
 }
 
-fn parse_tpdo1_rate(value: &str) -> anyhow::Result<Tpdo1Rate> {
-    match value {
-        "500" => Ok(Tpdo1Rate::Hz500),
-        "1000" => Ok(Tpdo1Rate::Hz1000),
-        _ => anyhow::bail!("TPDO1 rate must be 500 or 1000, got {value}"),
+fn parse_tpdo1_rate(value: &str) -> anyhow::Result<PdoProfile> {
+    // 速率是 1000/N Hz —— OD 里的 event timer 就是整毫秒，只有这些值可表达。
+    let hz: u32 = value.parse().map_err(|_| anyhow::anyhow!("TPDO1 rate must be a number, got {value}"))?;
+    if hz == 0 || 1000 % hz != 0 {
+        anyhow::bail!("TPDO1 rate must divide 1000 (1000/500/250/200/125/100/…), got {value}");
     }
+    Ok(PdoProfile::from_event_timer_ms((1000 / hz) as u16)?)
 }
 
 fn parse_u8(value: &str) -> anyhow::Result<u8> {
