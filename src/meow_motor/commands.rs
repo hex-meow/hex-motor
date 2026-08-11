@@ -169,6 +169,20 @@ pub fn build_clear_error_sdo_write() -> SdoWrite {
     SdoWrite::u8(0x4401, 0, 0xFF)
 }
 
+/// 重新触发一次 clear error 之前必须先下发的写入。
+///
+/// `0x4401` 是**值变化触发**的：写入与当前值相同的 command code 不会产生任何动作。
+/// 因此一次没能清掉错误之后再写一次 `0xFF` 等于什么都没做 —— `0x4401` 还停在
+/// `0xFF` 上，固件看不到跳变。必须先把它写回 `0`，下一个 `0xFF` 才重新构成一次
+/// 跳变。
+///
+/// 字节上它与 [`build_disable_sdo_write`] 相同（`0` 就是 Disable 命令），对一台
+/// 已经报错、没有输出的电机是安全的。这里单独命名是因为调用点的意图不同：它是
+/// 重新触发的前置条件，不是"把电机停下来"。
+pub fn build_clear_error_rearm_sdo_write() -> SdoWrite {
+    SdoWrite::u8(0x4401, 0, 0)
+}
+
 pub fn build_max_torque_sdo_write(torque_permille: u16) -> Result<SdoWrite, CommandBuildError> {
     if torque_permille > 1000 {
         return Err(CommandBuildError::MaxTorquePermilleOutOfRange(
@@ -344,6 +358,23 @@ mod tests {
     fn disable_and_clear_are_independent_one_shots() {
         assert_eq!(build_disable_sdo_write(), SdoWrite::u8(0x4401, 0, 0));
         assert_eq!(build_clear_error_sdo_write(), SdoWrite::u8(0x4401, 0, 0xFF));
+    }
+
+    /// 0x4401 是值变化触发的，所以重试序列必须真的改变它的值。这条断言就是那个
+    /// 前提：re-arm 与 trigger 不同值，且两者都写同一个对象。
+    #[test]
+    fn clear_error_retry_actually_changes_the_command_value() {
+        let rearm = build_clear_error_rearm_sdo_write();
+        let trigger = build_clear_error_sdo_write();
+        assert_eq!(rearm.index, trigger.index);
+        assert_eq!(rearm.subindex, trigger.subindex);
+        assert_ne!(
+            rearm.data, trigger.data,
+            "re-arming must change 0x4401, otherwise the retry is a no-op"
+        );
+        // 字节上就是 Disable；这条断言把这个等价关系钉住，免得日后有人以为
+        // re-arm 会额外做点别的。
+        assert_eq!(rearm, build_disable_sdo_write());
     }
 
     #[test]

@@ -28,9 +28,10 @@ use super::calibration::{
     read_from_device as read_calibration_from_device, MeowFactoryCalibration,
 };
 use super::commands::{
-    build_clear_error_sdo_write, build_compressed_mit_setup_sdo_writes, build_disable_sdo_write,
-    build_max_torque_sdo_write, build_mode_command_sdo_write, build_profile_limits_sdo_writes,
-    build_target_sdo_writes, MeowMotorTarget, MeowProfileLimits,
+    build_clear_error_rearm_sdo_write, build_clear_error_sdo_write,
+    build_compressed_mit_setup_sdo_writes, build_disable_sdo_write, build_max_torque_sdo_write,
+    build_mode_command_sdo_write, build_profile_limits_sdo_writes, build_target_sdo_writes,
+    MeowMotorTarget, MeowProfileLimits,
 };
 use super::discovery::{identify_and_cache, run_discovery, run_liveness_monitor};
 use super::entry::{MotorEntry, OperationRegistry};
@@ -49,6 +50,12 @@ use super::CompressedMitMapping;
 
 const SDO_WRITE_GAP: Duration = Duration::from_millis(2);
 const MODE_COMMAND_SDO_REWRITE_GAP: Duration = Duration::from_millis(5);
+
+/// 一次 clear error 最多触发几次。
+///
+/// 观察到的失败有两种，重试对两种都有效：`0x4401` 已经停在 `0xFF` 上，导致这次
+/// 写入根本不构成跳变；以及固件确实收到了触发但没能清掉 `0x8130` 一类的错误。
+const CLEAR_ERROR_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct MeowMotorManagerOptions {
@@ -147,6 +154,18 @@ struct IdentityToken {
     product_code: u32,
     revision_number: u32,
     serial_number: u32,
+}
+
+/// 一次 clear error 触发之后的确认结果。
+///
+/// 把"没清掉"和"这次操作出了硬错误"分开，是因为只有前者可以重试：`0x4401` 的值
+/// 变化触发意味着重试必须先 re-arm，而身份/会话不匹配一类的失败重试只会更糟。
+#[derive(Debug)]
+enum ClearOutcome {
+    Cleared,
+    /// 电机答复了，但确认超时，错误仍在。内含带 mode/detail 码的诊断，供最后
+    /// 一次尝试也失败时上报。
+    NotConfirmed(Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,17 +586,58 @@ impl MeowMotorManager {
                 nmt_revision: inner.nmt_revision,
             })
         };
-        let baseline = entry.inner.lock().unwrap().measurements.tpdo2_generation;
-        self.write_one(node_id, &build_clear_error_sdo_write())
-            .await?;
-        let command_completed_at = Instant::now();
-        if let Some(token) = operational {
-            self.ensure_operational_token(&entry, &token)?;
-            self.wait_for_clear_after(&entry, &token, baseline, command_completed_at)
-                .await
-        } else {
-            self.wait_sdo_clear_disabled(&entry, &identity).await
+        let mut not_confirmed = None;
+        for attempt in 0..CLEAR_ERROR_ATTEMPTS {
+            self.ensure_identity_token(&entry, &identity)?;
+            // Attempt 0 keeps the historical single write, so a healthy motor
+            // never sees a spurious Disable. Every later attempt must re-arm:
+            // 0x4401 is still holding the 0xFF that did not take effect.
+            let (baseline, command_completed_at) =
+                self.trigger_clear_error(&entry, attempt > 0).await?;
+            let outcome = if let Some(token) = operational.as_ref() {
+                self.ensure_operational_token(&entry, token)?;
+                self.wait_for_clear_after(&entry, token, baseline, command_completed_at)
+                    .await?
+            } else {
+                self.wait_sdo_clear_disabled(&entry, &identity).await?
+            };
+            match outcome {
+                ClearOutcome::Cleared => return Ok(()),
+                // The motor answered, it just is not clear yet. Keep the most
+                // recent diagnosis; it carries the observed mode/detail codes.
+                ClearOutcome::NotConfirmed(error) => not_confirmed = Some(error),
+            }
         }
+        Err(not_confirmed.expect("the attempt loop always runs at least once"))
+    }
+
+    /// Fires one clear-error trigger and reports what to confirm against.
+    ///
+    /// `0x4401` is change-of-value triggered, so writing `0xFF` while it already
+    /// holds `0xFF` does nothing at all. `rearm` writes it back to `0` first so
+    /// the next `0xFF` is a real transition — without it, "try clearing again"
+    /// silently never reaches the firmware.
+    ///
+    /// Returns the TPDO2 generation baseline captured after the re-arm and the
+    /// instant the trigger write completed.
+    async fn trigger_clear_error(
+        &self,
+        entry: &Arc<MotorEntry>,
+        rearm: bool,
+    ) -> Result<(u64, Instant)> {
+        if rearm {
+            // `write_one` already spaces consecutive 0x4401 writes by
+            // MODE_COMMAND_SDO_REWRITE_GAP, so the transition is not written
+            // faster than the device accepts.
+            self.write_one(entry.node_id, &build_clear_error_rearm_sdo_write())
+                .await?;
+        }
+        // After the re-arm, so a TPDO published in response to it cannot be
+        // mistaken for the trigger's own confirmation.
+        let baseline = entry.inner.lock().unwrap().measurements.tpdo2_generation;
+        self.write_one(entry.node_id, &build_clear_error_sdo_write())
+            .await?;
+        Ok((baseline, Instant::now()))
     }
 
     /// Updates a target without changing mode. The current fresh logic must be Enabled in the
@@ -1134,7 +1194,7 @@ impl MeowMotorManager {
         token: &OperationalToken,
         baseline: u64,
         command_completed_at: Instant,
-    ) -> Result<()> {
+    ) -> Result<ClearOutcome> {
         let deadline = Instant::now() + self.options.mode_confirm_timeout;
         let mut last_observed = None;
         loop {
@@ -1148,17 +1208,23 @@ impl MeowMotorManager {
                         .is_some_and(|received| received >= command_completed_at)
                 {
                     if clear_is_confirmed(inner.logic) {
-                        return Ok(());
+                        return Ok(ClearOutcome::Cleared);
                     }
                     last_observed = inner.logic;
                 }
             }
 
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(clear_confirmation_timeout(entry.node_id, last_observed));
+                return Ok(ClearOutcome::NotConfirmed(clear_confirmation_timeout(
+                    entry.node_id,
+                    last_observed,
+                )));
             };
             if tokio::time::timeout(remaining, notified).await.is_err() {
-                return Err(clear_confirmation_timeout(entry.node_id, last_observed));
+                return Ok(ClearOutcome::NotConfirmed(clear_confirmation_timeout(
+                    entry.node_id,
+                    last_observed,
+                )));
             }
         }
     }
@@ -1178,12 +1244,21 @@ impl MeowMotorManager {
         )
         .await?;
         self.ensure_identity_token(entry, token)?;
-        if matches!(display, 0xA1..=0xA6 | 0xAF) {
-            self.write_one(entry.node_id, &build_clear_error_sdo_write())
-                .await?;
-            self.wait_sdo_clear_disabled(entry, token).await?;
+        if !matches!(display, 0xA1..=0xA6 | 0xAF) {
+            return Ok(());
         }
-        Ok(())
+        // Same change-of-value hazard as `clear_error`: a stale 0xFF in 0x4401
+        // would make this initialization step a silent no-op.
+        let mut not_confirmed = None;
+        for attempt in 0..CLEAR_ERROR_ATTEMPTS {
+            self.ensure_identity_token(entry, token)?;
+            self.trigger_clear_error(entry, attempt > 0).await?;
+            match self.wait_sdo_clear_disabled(entry, token).await? {
+                ClearOutcome::Cleared => return Ok(()),
+                ClearOutcome::NotConfirmed(error) => not_confirmed = Some(error),
+            }
+        }
+        Err(not_confirmed.expect("the attempt loop always runs at least once"))
     }
 
     async fn wait_sdo_mode_disabled(
@@ -1236,7 +1311,7 @@ impl MeowMotorManager {
         &self,
         entry: &Arc<MotorEntry>,
         token: &IdentityToken,
-    ) -> Result<()> {
+    ) -> Result<ClearOutcome> {
         let deadline = Instant::now() + self.options.mode_confirm_timeout;
         loop {
             self.ensure_identity_token(entry, token)?;
@@ -1250,7 +1325,7 @@ impl MeowMotorManager {
             .await?;
             self.ensure_identity_token(entry, token)?;
             if display == 0 {
-                return Ok(());
+                return Ok(ClearOutcome::Cleared);
             }
             if Instant::now() >= deadline {
                 let detailed = if matches!(display, 0xA1..=0xA6 | 0xAF) {
@@ -1266,11 +1341,11 @@ impl MeowMotorManager {
                 } else {
                     None
                 };
-                return Err(clear_sdo_confirmation_timeout(
+                return Ok(ClearOutcome::NotConfirmed(clear_sdo_confirmation_timeout(
                     entry.node_id,
                     Some(display),
                     detailed,
-                ));
+                )));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1681,6 +1756,52 @@ mod tests {
         assert_eq!(options.pdo_profile, PdoProfile::default());
         assert!(options.configure_consumer_heartbeat);
         assert!(options.shared_host_pdo.is_none());
+    }
+
+    /// `0x4401` 只在**值变化**时触发。这条测试重放 `clear_error` 在全部尝试里发出
+    /// 的写序列，逐个检查哪些 `0xFF` 真的构成跳变。
+    ///
+    /// 被复现的现场故障是：`0x4401` 已经停在上一次没生效的 `0xFF` 上，此时再写
+    /// `0xFF` 固件什么都不做，用户看到的是"点了清除错误但完全没反应"。
+    #[test]
+    fn every_retry_is_a_real_0x4401_transition() {
+        let trigger = build_clear_error_sdo_write();
+        let rearm = build_clear_error_rearm_sdo_write();
+
+        let mut writes = Vec::new();
+        for attempt in 0..CLEAR_ERROR_ATTEMPTS {
+            // 与 `clear_error` / `clear_existing_error_sdo` 里的条件一致。
+            if attempt > 0 {
+                writes.push(rearm.clone());
+            }
+            writes.push(trigger.clone());
+        }
+
+        // 数一遍在给定的 0x4401 初值下，有多少次 0xFF 真的产生了跳变。
+        let effective_triggers = |initial: &[u8]| {
+            let mut on_wire = initial.to_vec();
+            let mut fired = 0;
+            for write in &writes {
+                assert_eq!((write.index, write.subindex), (0x4401, 0));
+                if write.data != on_wire {
+                    on_wire = write.data.clone();
+                    if on_wire == trigger.data {
+                        fired += 1;
+                    }
+                }
+            }
+            fired
+        };
+
+        // 正常情况：0x4401 停在某个 mode command 上，三次尝试都会触发。
+        assert_eq!(effective_triggers(&[3]), CLEAR_ERROR_ATTEMPTS);
+        // 故障现场：0x4401 已经是 0xFF，第一次写被固件忽略，但 re-arm 让后面
+        // 两次仍然能真的触发。修复前这里会是 0。
+        assert_eq!(effective_triggers(&trigger.data), CLEAR_ERROR_ATTEMPTS - 1);
+        assert!(
+            effective_triggers(&trigger.data) > 0,
+            "a stale 0xFF must not swallow every retry"
+        );
     }
 
     #[test]

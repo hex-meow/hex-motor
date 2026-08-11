@@ -26,10 +26,10 @@ pub use calibration::{
 };
 pub use codec::{decode_tpdo1, decode_tpdo2, CodecError, Tpdo1Frame, Tpdo2Frame};
 pub use commands::{
-    build_clear_error_sdo_write, build_compressed_mit_setup_sdo_writes, build_disable_sdo_write,
-    build_max_torque_sdo_write, build_mode_command_sdo_write, build_profile_limits_sdo_writes,
-    build_set_mode_sdo_writes, build_target_sdo_writes, CommandBuildError, MeowMitTarget,
-    MeowMotorTarget, MeowProfileLimits,
+    build_clear_error_rearm_sdo_write, build_clear_error_sdo_write,
+    build_compressed_mit_setup_sdo_writes, build_disable_sdo_write, build_max_torque_sdo_write,
+    build_mode_command_sdo_write, build_profile_limits_sdo_writes, build_set_mode_sdo_writes,
+    build_target_sdo_writes, CommandBuildError, MeowMitTarget, MeowMotorTarget, MeowProfileLimits,
 };
 pub use events::MeowMotorEvent;
 pub use fixed::{Q8_24Error, SignedQ8_24};
