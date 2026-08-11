@@ -4,6 +4,7 @@
 //! PDO codec/recipe、通信设置和 SDO 命令构造，以及建立在这些纯协议原语之上的异步
 //! manager。
 
+pub mod calibration;
 pub mod codec;
 pub mod commands;
 pub mod events;
@@ -18,6 +19,11 @@ mod discovery;
 mod entry;
 mod listener;
 
+pub use calibration::{
+    decode_e4m11, decode_factory_words, factory_crc16, FactoryDataError, MeowFactoryCalibration,
+    MeowFactoryCalibrationV1, MeowFrictionCalibration, MeowTorqueCalibration, FACTORY_DATA_INDEX,
+    FACTORY_DATA_WORD_COUNT, MANIFEST_UPPER_V1,
+};
 pub use codec::{decode_tpdo1, decode_tpdo2, CodecError, Tpdo1Frame, Tpdo2Frame};
 pub use commands::{
     build_clear_error_sdo_write, build_compressed_mit_setup_sdo_writes, build_disable_sdo_write,

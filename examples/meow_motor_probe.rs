@@ -11,7 +11,11 @@ use std::time::Duration;
 
 mod common;
 use hex_motor::canopen::sdo;
-use hex_motor::meow_motor::{lookup_model, MeowMotorCanSettings, SettingsError, SignedQ8_24};
+use hex_motor::meow_motor::{
+    calibration, lookup_model, MeowFactoryCalibration, MeowMotorCanSettings, SettingsError,
+    SignedQ8_24,
+};
+use hex_motor::types::MotorIdentity;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,7 +29,8 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| parse_u8(&value))
         .transpose()?
         .unwrap_or(1);
-    let timeout = Some(Duration::from_millis(250));
+    let sdo_timeout = Duration::from_millis(250);
+    let timeout = Some(sdo_timeout);
     let bus = common::open_bus(&iface).await?;
 
     let vendor_id = sdo::upload_u32(bus.as_ref(), node_id, 0x1018, 1, timeout).await?;
@@ -40,6 +45,45 @@ async fn main() -> anyhow::Result<()> {
 
     println!("{} at node 0x{node_id:02X}", model.display_name());
     println!("  identity       = {vendor_id:08X}/{product_code:08X}/{revision:08X}/{serial:08X}");
+
+    // 0x4001 出厂标定：只验 CRC，不验签发 token，也不把系数应用到任何命令。
+    let identity = MotorIdentity {
+        node_id,
+        vendor_id,
+        product_code,
+        revision_number: revision,
+        serial_number: serial,
+        product_name: None,
+    };
+    let calibration =
+        calibration::read_from_device(bus.as_ref(), node_id, &identity, sdo_timeout).await?;
+    match &calibration {
+        MeowFactoryCalibration::Valid(v1) => {
+            println!(
+                "  0x4001 v1      = torque factor {:.6}, fit RMSE {:.6} Nm, token 0x{:016X} (not verified offline)",
+                v1.torque.factor, v1.torque.fit_rmse_nm, v1.issuance_token
+            );
+            match &v1.friction {
+                Some(friction) => println!(
+                    "  friction (raw) = static +{:.6}/-{:.6} Nm, kinetic +{:.6}/-{:.6} Nm at {:.3} rad/s, {:.1} C",
+                    friction.static_pos_raw_nm,
+                    friction.static_neg_raw_nm,
+                    friction.kinetic_pos_raw_nm,
+                    friction.kinetic_neg_raw_nm,
+                    friction.kinetic_reference_speed_rad_per_s,
+                    friction.calibration_temperature_c
+                ),
+                None => println!("  friction (raw) = not calibrated at the factory"),
+            }
+            println!(
+                "  note           = hex-motor never applies these; the caller decides whether to \
+                 use raw = torque * factor + friction"
+            );
+        }
+        MeowFactoryCalibration::Missing { reason, .. } => {
+            println!("  0x4001         = no usable factory calibration ({reason})");
+        }
+    }
 
     let highest = sdo::upload_u8(bus.as_ref(), node_id, 0x2001, 0, timeout).await?;
     MeowMotorCanSettings::validate_highest_subindex(highest)

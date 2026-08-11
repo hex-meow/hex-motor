@@ -24,6 +24,9 @@ use crate::cia402::PdoProfile;
 use crate::error::{Error, Result};
 use crate::types::MotorIdentity;
 
+use super::calibration::{
+    read_from_device as read_calibration_from_device, MeowFactoryCalibration,
+};
 use super::commands::{
     build_clear_error_sdo_write, build_compressed_mit_setup_sdo_writes, build_disable_sdo_write,
     build_max_torque_sdo_write, build_mode_command_sdo_write, build_profile_limits_sdo_writes,
@@ -720,6 +723,40 @@ impl MeowMotorManager {
         };
         entry.publish(live);
         Ok(settings)
+    }
+
+    /// 只读读取 `0x4001` 出厂标定区。
+    ///
+    /// 只检查 v1 布局与 CRC 自洽性：**不验证 8-byte 签发 token**（那需要联网查签发
+    /// 账本），也**不把 torque factor 或摩擦力应用到任何命令路径** —— 解出的物理量
+    /// 原样返回给调用方，由调用方决定是否补偿。
+    ///
+    /// "这台电机没有有效出厂标定"是正常结果
+    /// [`MeowFactoryCalibration::Missing`]，只有 SDO/传输失败才返回 `Err`。
+    pub async fn read_factory_calibration(&self, node_id: u8) -> Result<MeowFactoryCalibration> {
+        let entry = self.require_exact_entry(node_id)?;
+        let _guard = self
+            .operations
+            .try_acquire(node_id, "read factory calibration")?;
+        let token = self.identity_token(&entry)?;
+        let identity = {
+            let inner = entry.inner.lock().unwrap();
+            inner.identity.clone().ok_or_else(|| Error::NotReady {
+                nid: node_id,
+                lifecycle: format!("{:?} without identity", inner.lifecycle),
+            })?
+        };
+        let calibration = read_calibration_from_device(
+            self.bus.as_ref(),
+            node_id,
+            &identity,
+            self.options.sdo_timeout,
+        )
+        .await?;
+        // The CRC is bound to 0x1018, so a session change mid-read would make the
+        // verdict belong to a different motor.
+        self.ensure_identity_token(&entry, &token)?;
+        Ok(calibration)
     }
 
     /// Applies 0x2001 fields, reads all four fields back, then saves only 0x1010:04.
