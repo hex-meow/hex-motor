@@ -405,7 +405,7 @@ async fn upload_optional(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meow_motor::identity::{PRODUCT_CODE_4310, VENDOR_ID};
+    use crate::meow_motor::identity::{PRODUCT_CODE_3525, PRODUCT_CODE_4310, VENDOR_ID};
 
     const SERIAL: u32 = 0x0111_B49A;
     const TOKEN: u64 = 0x0123_4567_89AB_CDEF;
@@ -454,6 +454,24 @@ mod tests {
         let crc = u32::from(factory_crc16(&identity(), &words));
         words[0] = (u32::from(MANIFEST_UPPER_V1) << 16) | crc;
         words
+    }
+
+    #[test]
+    fn motor_3525_factory_calibration_is_bound_to_its_product_identity() {
+        let motor = MotorIdentity {
+            product_code: PRODUCT_CODE_3525,
+            ..identity()
+        };
+        let mut words = WORDS_NO_FRICTION;
+        words[0] = (u32::from(MANIFEST_UPPER_V1) << 16) | u32::from(factory_crc16(&motor, &words));
+        assert!(decode_factory_words(&motor, words).is_valid());
+        assert!(matches!(
+            decode_factory_words(&identity(), words),
+            MeowFactoryCalibration::Missing {
+                reason: FactoryDataError::CrcMismatch { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

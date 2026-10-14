@@ -34,8 +34,8 @@ pub use commands::{
 pub use events::MeowMotorEvent;
 pub use fixed::{Q8_24Error, SignedQ8_24};
 pub use identity::{
-    lookup_model, model_for_identity, MeowMotorModel, PRODUCT_CODE_4310, PRODUCT_CODE_4342,
-    VENDOR_ID,
+    lookup_model, model_for_identity, MeowMotorModel, PRODUCT_CODE_3525, PRODUCT_CODE_4310,
+    PRODUCT_CODE_4342, VENDOR_ID,
 };
 pub use manager::{
     MeowMotorInitializeOptions, MeowMotorManager, MeowMotorManagerOptions, SharedHostPdoConfig,
