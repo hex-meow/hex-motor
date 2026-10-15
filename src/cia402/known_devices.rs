@@ -78,6 +78,12 @@ pub const KNOWN_DEVICES: &[KnownDevice] = &[
     },
     KnownDevice {
         vendor_id: 0x0068_6578,
+        product_code: 0x6C64_AE8D,
+        name: "hexmeow 3525",
+        min_revision_number: 0,
+    },
+    KnownDevice {
+        vendor_id: 0x0068_6578,
         product_code: 0x6C64_BC78,
         name: "hexmeow 4310",
         min_revision_number: 0,

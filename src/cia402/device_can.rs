@@ -27,6 +27,7 @@ const OBJECT_2001_IDENTITIES: &[(u32, u32)] = &[
     (0x4859_444C, 0xAAAA_0001),
     (0x4859_444C, 0xAAAA_0002),
     (0x4859_444C, 0xAAAA_0005),
+    (0x0068_6578, 0x6C64_AE8D),
     (0x0068_6578, 0x6C64_BC78),
     (0x0068_6578, 0x6C64_BCAA),
 ];
@@ -427,12 +428,14 @@ mod tests {
                 Some(CanConfigDialect::Object2001)
             );
         }
-        for product_code in [0x6C64_BC78, 0x6C64_BCAA] {
+        for product_code in [0x6C64_AE8D, 0x6C64_BC78, 0x6C64_BCAA] {
             assert_eq!(
                 dialect_for(&identity(0x0068_6578, product_code)),
                 Some(CanConfigDialect::Object2001)
             );
         }
+        assert_eq!(dialect_for(&identity(0x4859_444C, 0x6C64_AE8D)), None);
+        assert_eq!(dialect_for(&identity(0x6865_786D, 0x6C64_AE8D)), None);
         assert_eq!(dialect_for(&identity(0x4859_444C, 0xAAAA_9999)), None);
         assert_eq!(dialect_for(&identity(0x0068_6578, 0xAAAA_0001)), None);
         assert_eq!(dialect_for(&identity(0x0068_6578, 0x6C64_BC79)), None);
@@ -731,6 +734,42 @@ mod tests {
         assert!(validate_role_node_id(0x6865_786D, 0x006C_6674, 20).is_ok());
         assert!(validate_role_node_id(0x6865_786D, 0x006C_6674, 21).is_err());
         assert!(validate_role_node_id(0x4859_444C, 0xAAAA_0001, 99).is_ok());
+    }
+
+    #[tokio::test]
+    async fn motor_3525_discovery_reports_available_can_config() {
+        let motor = identity(0x0068_6578, 0x6C64_AE8D);
+        let bus = ScriptedSdoBus::new([
+            ((0x2001, 0), vec![4]),
+            ((0x2001, 1), vec![1]),
+            ((0x2001, 2), 1_000_000u32.to_le_bytes().to_vec()),
+            ((0x2001, 3), 5_000_000u32.to_le_bytes().to_vec()),
+            ((0x2001, 4), vec![1]),
+        ]);
+        let status = read_device_can_config(&bus, &motor, Duration::from_millis(20)).await;
+        assert_eq!(
+            status,
+            DeviceCanConfigStatus::Available(DeviceCanConfig {
+                stored_node_id: 1,
+                nominal_bitrate: 1_000_000,
+                data_bitrate: Some(5_000_000),
+                transmit_pdo_brs: Some(true),
+            })
+        );
+        assert_eq!(
+            bus.requests(),
+            vec![
+                (0x2001, 0),
+                (0x2001, 1),
+                (0x2001, 2),
+                (0x2001, 3),
+                (0x2001, 4)
+            ]
+        );
+        assert_eq!(
+            crate::cia402::known_devices::human_friendly_name(&motor),
+            "hexmeow 3525"
+        );
     }
 
     #[tokio::test]
