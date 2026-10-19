@@ -733,10 +733,11 @@ impl Cia402Manager {
             .retain(|_, e| e.inner.lock().unwrap().online);
     }
 
-    /// 身份严格的位置预设。只允许三条已知 0x2001 电机身份。
+    /// 身份严格的位置预设。支持精确注册的 CiA402 与 Meow Motor 身份。
     ///
-    /// 写控制字 0 后会有界轮询 0x6041，确认进入 Switch On Disabled，随后才写
-    /// 位置和 `"pres"`。整个过程不会发送 NMT 或后台重试。
+    /// 按协议请求失能并有界确认状态，随后写相同的 0x3001 位置和 `"pres"`。
+    /// Meow Motor 使用 0x4401/0x4402，CiA402 使用 0x6040/0x6041。
+    /// 整个过程不会发送 NMT、清除故障或自动重新使能。
     pub async fn set_position_preset_for(
         &self,
         nid: u8,
@@ -750,7 +751,20 @@ impl Cia402Manager {
                 "position preset is only supported for an exact known motor identity",
             ));
         }
+        if !pos.is_finite() {
+            return Err(device_operation_rejected(
+                nid,
+                "position preset must be finite",
+            ));
+        }
         let pos = pos.clamp(-0.5, 0.5);
+        let meow =
+            crate::meow_motor::lookup_model(expected_vendor_id, expected_product_code).is_some();
+        let disable = if meow {
+            SdoWrite::u8(0x4401, 0, 0)
+        } else {
+            SdoWrite::u16(0x6040, 0, 0)
+        };
         let _guard = InflightGuard::acquire(&self.inflight_ops, nid, "set_position_preset")?;
         let (entry, session) = self.require_current_session_online(nid, false)?;
         self.verify_identity_tuple_in_session(
@@ -763,31 +777,28 @@ impl Cia402Manager {
         )
         .await?;
         let timeout = Some(self.opts.sdo_timeout);
-        self.sdo_download_session_checked(
-            nid,
-            &entry,
-            session,
-            false,
-            &[SdoWrite::u16(0x6040, 0, 0x0000)],
-        )
-        .await?;
+        self.sdo_download_session_checked(nid, &entry, session, false, &[disable])
+            .await?;
 
         let deadline = Instant::now() + self.opts.mode_confirm_timeout;
         loop {
             self.ensure_device_session(nid, &entry, session, false)?;
-            let status_word =
-                sdo::upload_u16(self.bus.as_ref(), nid, 0x6041, 0, timeout).await?;
+            let disabled = if meow {
+                sdo::upload_u8(self.bus.as_ref(), nid, 0x4402, 0, timeout).await? == 0
+            } else {
+                let status_word =
+                    sdo::upload_u16(self.bus.as_ref(), nid, 0x6041, 0, timeout).await?;
+                // CiA402 Switch On Disabled ignores the Quick Stop bit.
+                status_word & 0x004F == 0x0040
+            };
             self.ensure_device_session(nid, &entry, session, false)?;
-            // CiA 402 Switch On Disabled uses mask 0x004F/value 0x0040.
-            // Bit 5 (Quick Stop) is not part of this state classification, so
-            // both device-reported 0x0250 and 0x0270 must be accepted.
-            if status_word & 0x004F == 0x0040 {
+            if disabled {
                 break;
             }
             if Instant::now() >= deadline {
                 return Err(Error::DeviceOperationTimeout {
                     nid,
-                    operation: "waiting for Switch On Disabled before position preset",
+                    operation: "waiting for Disabled before position preset",
                 });
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -808,7 +819,7 @@ impl Cia402Manager {
         Ok(())
     }
 
-    /// 身份严格地按需读一次已知电机当前位置 `0x6064`。
+    /// 身份严格地按需读一次位置：CiA402 0x6064 REAL32，Meow Motor 0x4564 Q8.24。
     pub async fn read_position_for(
         &self,
         nid: u8,
@@ -833,9 +844,15 @@ impl Cia402Manager {
         )
         .await?;
         self.ensure_device_session(nid, &entry, session, false)?;
-        let position =
-            sdo::upload_f32(self.bus.as_ref(), nid, 0x6064, 0, Some(self.opts.sdo_timeout))
-                .await?;
+        let timeout = Some(self.opts.sdo_timeout);
+        let position = if crate::meow_motor::lookup_model(expected_vendor_id, expected_product_code)
+            .is_some()
+        {
+            let raw = sdo::upload_u32(self.bus.as_ref(), nid, 0x4564, 0, timeout).await? as i32;
+            crate::meow_motor::SignedQ8_24::from_raw(raw).to_revolutions() as f32
+        } else {
+            sdo::upload_f32(self.bus.as_ref(), nid, 0x6064, 0, timeout).await?
+        };
         self.ensure_device_session(nid, &entry, session, false)?;
         Ok(position)
     }
@@ -2530,6 +2547,172 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn meow_position_preset_uses_3001_only_after_disabled() {
+        for product in [0x6C64_AE8Du32, 0x6C64_BC78, 0x6C64_BCAA] {
+            let bus = Arc::new(ScriptedSettingsBus::new([
+                ((1, 0x1018, 1), vec![0x0068_6578u32.to_le_bytes().to_vec()]),
+                ((1, 0x1018, 2), vec![product.to_le_bytes().to_vec()]),
+                ((1, 0x4402, 0), vec![vec![2], vec![0]]),
+            ]));
+            let manager = test_manager(bus.clone());
+            add_online_entry(&manager, 1, 0x0068_6578, product, NmtState::PreOperational);
+            manager
+                .set_position_preset_for(1, 0x0068_6578, product, 0.25)
+                .await
+                .unwrap();
+            let requests = bus.requests();
+            assert_eq!(
+                requests,
+                vec![
+                    RecordedSdo::Upload {
+                        index: 0x1018,
+                        subindex: 1
+                    },
+                    RecordedSdo::Upload {
+                        index: 0x1018,
+                        subindex: 2
+                    },
+                    RecordedSdo::Download {
+                        index: 0x4401,
+                        subindex: 0,
+                        data: vec![0]
+                    },
+                    RecordedSdo::Upload {
+                        index: 0x4402,
+                        subindex: 0
+                    },
+                    RecordedSdo::Upload {
+                        index: 0x4402,
+                        subindex: 0
+                    },
+                    RecordedSdo::Download {
+                        index: 0x3001,
+                        subindex: 1,
+                        data: 0.25f32.to_le_bytes().to_vec()
+                    },
+                    RecordedSdo::Download {
+                        index: 0x3001,
+                        subindex: 2,
+                        data: 0x7365_7270u32.to_le_bytes().to_vec()
+                    },
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn meow_position_read_decodes_signed_q8_24() {
+        for position in [-127.125f32, -0.25, 0.0, 0.375, 127.125] {
+            let raw = (f64::from(position) * 16_777_216.0) as i32;
+            let bus = Arc::new(ScriptedSettingsBus::new([
+                ((1, 0x1018, 1), vec![0x0068_6578u32.to_le_bytes().to_vec()]),
+                ((1, 0x1018, 2), vec![0x6C64_AE8Du32.to_le_bytes().to_vec()]),
+                ((1, 0x4564, 0), vec![raw.to_le_bytes().to_vec()]),
+            ]));
+            let manager = test_manager(bus.clone());
+            add_online_entry(&manager, 1, 0x0068_6578, 0x6C64_AE8D, NmtState::Operational);
+            assert_eq!(
+                manager
+                    .read_position_for(1, 0x0068_6578, 0x6C64_AE8D)
+                    .await
+                    .unwrap(),
+                position
+            );
+            assert!(bus
+                .requests()
+                .iter()
+                .all(|r| matches!(r, RecordedSdo::Upload { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn meow_position_preset_does_not_commit_when_disable_is_unconfirmed_or_faulted() {
+        for mode in [2, 0xA4] {
+            let bus = Arc::new(ScriptedSettingsBus::new([
+                ((1, 0x1018, 1), vec![0x0068_6578u32.to_le_bytes().to_vec()]),
+                ((1, 0x1018, 2), vec![0x6C64_AE8Du32.to_le_bytes().to_vec()]),
+                ((1, 0x4402, 0), vec![vec![mode]]),
+            ]));
+            let manager = test_manager(bus.clone());
+            add_online_entry(&manager, 1, 0x0068_6578, 0x6C64_AE8D, NmtState::Operational);
+            assert!(manager
+                .set_position_preset_for(1, 0x0068_6578, 0x6C64_AE8D, 0.0)
+                .await
+                .is_err());
+            let writes = bus
+                .requests()
+                .into_iter()
+                .filter(|r| matches!(r, RecordedSdo::Download { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                writes,
+                vec![RecordedSdo::Download {
+                    index: 0x4401,
+                    subindex: 0,
+                    data: vec![0]
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn meow_position_preset_stops_on_session_change_after_disable() {
+        let bus = Arc::new(ScriptedSettingsBus::new([
+            ((1, 0x1018, 1), vec![0x0068_6578u32.to_le_bytes().to_vec()]),
+            ((1, 0x1018, 2), vec![0x6C64_AE8Du32.to_le_bytes().to_vec()]),
+            ((1, 0x4402, 0), vec![vec![0]]),
+        ]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(&manager, 1, 0x0068_6578, 0x6C64_AE8D, NmtState::Operational);
+        let active_entry = entry(&manager, 1);
+        bus.set_send_hook(Arc::new(move |_, request| {
+            if matches!(request, RecordedSdo::Upload { index: 0x4402, .. }) {
+                active_entry.inner.lock().unwrap().session_epoch += 1;
+            }
+        }));
+        let error = manager
+            .set_position_preset_for(1, 0x0068_6578, 0x6C64_AE8D, 0.0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session changed"));
+        assert!(!bus
+            .requests()
+            .iter()
+            .any(|r| matches!(r, RecordedSdo::Download { index: 0x3001, .. })));
+    }
+
+    #[tokio::test]
+    async fn meow_position_identity_mismatch_blocks_disable_and_preset() {
+        let bus = Arc::new(ScriptedSettingsBus::new([
+            ((1, 0x1018, 1), vec![0x0068_6578u32.to_le_bytes().to_vec()]),
+            ((1, 0x1018, 2), vec![0x6C64_BC78u32.to_le_bytes().to_vec()]),
+        ]));
+        let manager = test_manager(bus.clone());
+        add_online_entry(&manager, 1, 0x0068_6578, 0x6C64_AE8D, NmtState::Operational);
+        assert!(manager
+            .set_position_preset_for(1, 0x0068_6578, 0x6C64_AE8D, 0.0)
+            .await
+            .is_err());
+        assert!(bus
+            .requests()
+            .iter()
+            .all(|r| matches!(r, RecordedSdo::Upload { .. })));
+    }
+
+    #[tokio::test]
+    async fn position_preset_rejects_nonfinite_input_before_sdo() {
+        let bus = Arc::new(ScriptedSettingsBus::new([]));
+        let manager = test_manager(bus.clone());
+        for pos in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(manager
+                .set_position_preset_for(1, 0x0068_6578, 0x6C64_AE8D, pos)
+                .await
+                .is_err());
+        }
+        assert!(bus.requests().is_empty());
     }
 
     #[tokio::test]
